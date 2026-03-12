@@ -124,7 +124,7 @@ func (p *Processor) runJob(
 	if err := p.preProcessJob(ctx, jobInfo, &cancelRequested); err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "pre-process failed")
-		p.handleJobError(ctx, err, nil, jobItem, updater, task)
+		p.handleJobError(ctx, err, jobItem, updater, task, nil, nil)
 		return
 	}
 
@@ -133,7 +133,7 @@ func (p *Processor) runJob(
 		logger.V(logging.ERROR).Error(err, "Failed to update status to in_progress")
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "status transition failed")
-		if failErr := p.handleFailed(ctx, jobItem, updater); failErr != nil {
+		if failErr := p.handleFailed(ctx, updater, jobItem, nil); failErr != nil {
 			logger.V(logging.ERROR).Error(failErr, "Failed to handle failed event")
 		}
 		return
@@ -142,17 +142,29 @@ func (p *Processor) runJob(
 	// phase 2: execute inference requests
 	requestCounts, err := p.executeJob(ctx, sloCtx, updater, jobInfo, &cancelRequested)
 	if err != nil {
-		if errors.Is(err, ErrExpired) {
+		switch {
+		case errors.Is(err, ErrExpired):
 			if expiredErr := p.handleExpired(ctx, updater, jobItem, jobInfo, requestCounts); expiredErr != nil {
 				logger.V(logging.ERROR).Error(expiredErr, "Failed to finalize expired job")
 				span.RecordError(expiredErr)
 				span.SetStatus(codes.Error, "expired finalization failed")
 			}
 			metrics.RecordJobProcessingDuration(time.Since(jobStart), jobItem.TenantID, metrics.GetSizeBucket(int(requestCounts.Total)))
-		} else {
+
+		case errors.Is(err, ErrCancelled):
+			if cancelErr := p.handleCancelled(ctx, updater, jobItem, jobInfo, requestCounts); cancelErr != nil {
+				logger.V(logging.ERROR).Error(cancelErr, "Failed to finalize cancelled job")
+				span.RecordError(cancelErr)
+				span.SetStatus(codes.Error, "cancelled finalization failed")
+			}
+			if requestCounts != nil {
+				metrics.RecordJobProcessingDuration(time.Since(jobStart), jobItem.TenantID, metrics.GetSizeBucket(int(requestCounts.Total)))
+			}
+
+		default:
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "execution failed")
-			p.handleJobError(ctx, err, requestCounts, jobItem, updater, task)
+			p.handleJobError(ctx, err, jobItem, updater, task, requestCounts, jobInfo)
 		}
 		return
 	}
@@ -162,7 +174,9 @@ func (p *Processor) runJob(
 		logger.V(logging.ERROR).Error(err, "Failed to finalize job")
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "finalize failed")
-		if failErr := p.handleFailed(ctx, jobItem, updater); failErr != nil {
+		// Upload retries already exhausted inside finalizeJob — don't re-attempt upload.
+		// Pass requestCounts so they are recorded in the failed status.
+		if failErr := p.handleFailed(ctx, updater, jobItem, requestCounts); failErr != nil {
 			logger.V(logging.ERROR).Error(failErr, "Failed to handle failed event")
 		}
 		return
@@ -176,19 +190,22 @@ func (p *Processor) runJob(
 }
 
 // handleJobError routes a phase error to the appropriate handler (cancel, re-enqueue, or fail).
+// requestCounts and jobInfo are non-nil only when the error originates from Phase 2 (executeJob).
 func (p *Processor) handleJobError(
 	ctx context.Context,
 	err error,
-	requestCounts *openai.BatchRequestCounts,
 	jobItem *db.BatchItem,
 	updater *StatusUpdater,
 	task *db.BatchJobPriority,
+	requestCounts *openai.BatchRequestCounts,
+	jobInfo *batch_types.JobInfo,
 ) {
 	logger := klog.FromContext(ctx)
 
 	switch {
 	case errors.Is(err, ErrCancelled):
-		if cancelErr := p.handleCancelled(ctx, jobItem, updater, requestCounts); cancelErr != nil {
+		// Phase 1 cancel: no output files exist yet
+		if cancelErr := p.handleCancelled(ctx, updater, jobItem, nil, nil); cancelErr != nil {
 			logger.V(logging.ERROR).Error(cancelErr, "Failed to handle cancelled event")
 		}
 
@@ -199,10 +216,8 @@ func (p *Processor) handleJobError(
 		if task != nil {
 			bgCtx := klog.NewContext(context.Background(), klog.FromContext(ctx))
 			if enqErr := p.poller.enqueueOne(bgCtx, task); enqErr != nil {
-				// re-enqueue failed, handle as failed
 				logger.V(logging.ERROR).Error(enqErr, "Failed to re-enqueue the job to the queue")
-				if failErr := p.handleFailed(bgCtx, jobItem, updater); failErr != nil {
-					// best-effort
+				if failErr := p.handleFailed(bgCtx, updater, jobItem, nil); failErr != nil {
 					logger.V(logging.ERROR).Error(failErr, "Failed to mark job as failed after re-enqueue failure")
 				}
 			} else {
@@ -210,17 +225,48 @@ func (p *Processor) handleJobError(
 				logger.V(logging.INFO).Info("Re-enqueued the job to the queue")
 			}
 		}
+
 	default:
-		if failErr := p.handleFailed(ctx, jobItem, updater); failErr != nil {
-			logger.V(logging.ERROR).Error(failErr, "Failed to handle failed event")
+		if requestCounts != nil && jobInfo != nil {
+			if failErr := p.handleFailedWithPartial(ctx, updater, jobItem, jobInfo, requestCounts); failErr != nil {
+				logger.V(logging.ERROR).Error(failErr, "Failed to handle failed event with partial output")
+			}
+		} else {
+			if failErr := p.handleFailed(ctx, updater, jobItem, nil); failErr != nil {
+				logger.V(logging.ERROR).Error(failErr, "Failed to handle failed event")
+			}
 		}
 	}
+}
+
+// uploadPartialResults uploads whatever output/error files exist locally to shared storage.
+// Returns file IDs (empty string if the file was empty or upload failed).
+// Errors are logged but not propagated — partial upload is best-effort.
+func (p *Processor) uploadPartialResults(
+	ctx context.Context,
+	jobInfo *batch_types.JobInfo,
+	dbJob *db.BatchItem,
+) (outputFileID string, errorFileID string) {
+	logger := klog.FromContext(ctx)
+
+	var err error
+	outputFileID, err = p.uploadFileAndStoreFileRecord(ctx, jobInfo, dbJob, metrics.FileTypeOutput)
+	if err != nil {
+		logger.V(logging.ERROR).Error(err, "Failed to upload output file (best-effort)")
+	}
+
+	errorFileID, err = p.uploadFileAndStoreFileRecord(ctx, jobInfo, dbJob, metrics.FileTypeError)
+	if err != nil {
+		logger.V(logging.ERROR).Error(err, "Failed to upload error file (best-effort)")
+	}
+
+	return outputFileID, errorFileID
 }
 
 // handleExpired finalizes a job whose SLO deadline fired during execution.
 // Partial results are preserved: completed requests remain in the output file,
 // and unexecuted requests were already written to the error file as "batch_expired"
-// by drainUndispatchedAsExpired. This function uploads both files and transitions
+// by drainUnprocessedRequests. This function uploads both files and transitions
 // the job directly to expired status (in_progress → expired).
 func (p *Processor) handleExpired(
 	ctx context.Context,
@@ -232,18 +278,8 @@ func (p *Processor) handleExpired(
 	logger := klog.FromContext(ctx)
 	logger.V(logging.INFO).Info("Job SLO expired mid-execution, uploading partial results")
 
-	// Upload partial results best-effort: errors are logged but do not block the expired status update.
-	outputFileID, err := p.uploadFileAndStoreFileRecord(ctx, jobInfo, dbJob, metrics.FileTypeOutput)
-	if err != nil {
-		logger.V(logging.ERROR).Error(err, "Failed to upload output file for expired job")
-	}
+	outputFileID, errorFileID := p.uploadPartialResults(ctx, jobInfo, dbJob)
 
-	errorFileID, err := p.uploadFileAndStoreFileRecord(ctx, jobInfo, dbJob, metrics.FileTypeError)
-	if err != nil {
-		logger.V(logging.ERROR).Error(err, "Failed to upload error file for expired job")
-	}
-
-	// cleanup local artifacts (best-effort)
 	p.cleanupJobArtifacts(ctx, dbJob.ID, dbJob.TenantID)
 
 	if err := updater.UpdateExpiredStatus(ctx, dbJob, requestCounts, outputFileID, errorFileID); err != nil {
@@ -251,36 +287,74 @@ func (p *Processor) handleExpired(
 		return err
 	}
 
-	if requestCounts != nil {
-		uotel.SetAttr(ctx,
-			attribute.Int64(uotel.AttrRequestTotal, requestCounts.Total),
-			attribute.Int64(uotel.AttrRequestCompleted, requestCounts.Completed),
-			attribute.Int64(uotel.AttrRequestFailed, requestCounts.Failed),
-		)
-	}
+	setRequestCountAttrs(ctx, requestCounts)
 
 	metrics.RecordJobProcessed(metrics.ResultExpired, metrics.ReasonExpiredExecution)
 	logger.V(logging.INFO).Info("Job expired handled", "outputFileID", outputFileID, "errorFileID", errorFileID)
 	return nil
 }
 
-func (p *Processor) handleFailed(
+// handleFailedWithPartial finalizes a Phase 2 failure by uploading partial results before
+// transitioning to failed status. Completed requests are preserved in the output file,
+// and unexecuted requests were already drained to the error file as "batch_failed".
+func (p *Processor) handleFailedWithPartial(
 	ctx context.Context,
-	jobItem *db.BatchItem,
 	updater *StatusUpdater,
+	jobItem *db.BatchItem,
+	jobInfo *batch_types.JobInfo,
+	requestCounts *openai.BatchRequestCounts,
 ) error {
 	logger := klog.FromContext(ctx)
+	logger.V(logging.INFO).Info("Job failed mid-execution, uploading partial results")
 
-	// cleanup local artifacts (best-effort)
+	outputFileID, errorFileID := p.uploadPartialResults(ctx, jobInfo, jobItem)
+
 	p.cleanupJobArtifacts(ctx, jobItem.ID, jobItem.TenantID)
 
-	// update persistent status -> failed
-	if err := updater.UpdatePersistentStatus(ctx, jobItem, openai.BatchStatusFailed, nil, nil); err != nil {
+	if err := updater.UpdateFailedStatus(ctx, jobItem, requestCounts, outputFileID, errorFileID); err != nil {
 		logger.V(logging.ERROR).Error(err, "Failed to update status to failed")
 		return err
 	}
 
+	setRequestCountAttrs(ctx, requestCounts)
+
+	metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
+	logger.V(logging.INFO).Info("Job failed handled with partial output", "outputFileID", outputFileID, "errorFileID", errorFileID)
+	return nil
+}
+
+// handleFailed finalizes a failed job without partial output upload.
+// Used for Phase 1 failures (no output files), Phase 3 failures (upload retries exhausted),
+// and re-enqueue failures (infrastructure-level issue). requestCounts is recorded in DB when non-nil.
+func (p *Processor) handleFailed(
+	ctx context.Context,
+	updater *StatusUpdater,
+	jobItem *db.BatchItem,
+	requestCounts *openai.BatchRequestCounts,
+) error {
+	logger := klog.FromContext(ctx)
+
+	p.cleanupJobArtifacts(ctx, jobItem.ID, jobItem.TenantID)
+
+	if err := updater.UpdateFailedStatus(ctx, jobItem, requestCounts, "", ""); err != nil {
+		logger.V(logging.ERROR).Error(err, "Failed to update status to failed")
+		return err
+	}
+
+	setRequestCountAttrs(ctx, requestCounts)
+
 	metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
 	logger.V(logging.INFO).Info("Job failed handled")
 	return nil
+}
+
+func setRequestCountAttrs(ctx context.Context, counts *openai.BatchRequestCounts) {
+	if counts == nil {
+		return
+	}
+	uotel.SetAttr(ctx,
+		attribute.Int64(uotel.AttrRequestTotal, counts.Total),
+		attribute.Int64(uotel.AttrRequestCompleted, counts.Completed),
+		attribute.Int64(uotel.AttrRequestFailed, counts.Failed),
+	)
 }

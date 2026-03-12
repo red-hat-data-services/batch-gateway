@@ -47,15 +47,6 @@ import (
 	"github.com/llm-d-incubation/batch-gateway/internal/util/semaphore"
 )
 
-// ErrExpired is returned by executeJob when the job's SLO deadline fires during execution.
-// Partial results (completed requests in output file, unexecuted requests in error file as
-// "batch_expired") are preserved. The caller is responsible for finalizing with expired status.
-var ErrExpired = errors.New("batch SLO expired")
-
-// errCodeBatchExpired is the error code written to the error file for requests that could not
-// be executed before the job's completion window expired, per the OpenAI Batch API spec.
-const errCodeBatchExpired = "batch_expired"
-
 // outputWriters holds the buffered writers and their mutexes for the output and error JSONL files.
 // A single instance is created per job and shared across model goroutines.
 type outputWriters struct {
@@ -126,11 +117,15 @@ func (ep *executionProgress) counts() *openai.BatchRequestCounts {
 
 // executeJob performs phase 2: reads plan files per model, sends inference
 // requests concurrently (one goroutine per model), and writes results to
-// output.jsonl (successes) and error.jsonl (failures). Returns request counts for finalization.
+// output.jsonl (successes) and error.jsonl (failures).
 //
-// sloCtx carries the SLO deadline; equals ctx when no SLO is set. When the deadline fires,
-// dispatch stops, undispatched requests are drained to the error file as "batch_expired", and
-// ErrExpired is returned alongside partial counts. The caller should finalize with expired status.
+// On success, returns (counts, nil). On interruption or error, undispatched requests are
+// drained to the error file with the appropriate code, writers are flushed, and partial counts
+// are returned alongside the sentinel/cause error:
+//   - SLO expired:    (counts, ErrExpired)    — drain as batch_expired
+//   - User cancel:    (counts, ErrCancelled)  — drain as batch_cancelled
+//   - System error:   (counts, firstErr)      — drain as batch_failed
+//   - Pod shutdown:   (nil, ctx.Err())        — no flush, caller re-enqueues
 func (p *Processor) executeJob(
 	ctx context.Context,
 	sloCtx context.Context,
@@ -224,6 +219,9 @@ func (p *Processor) executeJob(
 	}
 
 	for safeModelID, modelID := range modelMap.SafeToModel {
+		// Ordering guarantee: processModel returns → execCancel → errCh send.
+		// This ensures the first real error reaches errCh before any context.Canceled
+		// from other models whose contexts were cancelled by execCancel.
 		go func(safeModelID, modelID string) {
 			err := p.processModel(
 				execCtx,
@@ -255,7 +253,12 @@ func (p *Processor) executeJob(
 			return nil, ctx.Err() // parent-context error (e.g. pod shutdown)
 		}
 		if cancelRequested.Load() {
-			return progress.counts(), ErrCancelled // user-initiated cancel
+			_ = writers.output.Flush()
+			_ = writers.errors.Flush()
+			counts := progress.counts()
+			logger.V(logging.INFO).Info("Phase 2: cancelled, returning partial counts",
+				"total", counts.Total, "completed", counts.Completed, "failed", counts.Failed)
+			return counts, ErrCancelled
 		}
 		// SLO deadline exceeded: sloCtx deadline fired during execution.
 		// processModel already drained undispatched entries to error file; flush and return partial counts.
@@ -270,8 +273,13 @@ func (p *Processor) executeJob(
 				"total", counts.Total, "completed", counts.Completed, "failed", counts.Failed)
 			return counts, ErrExpired
 		}
-		// process error from model goroutines
-		return nil, firstErr
+		// System error from model goroutines — flush partial results.
+		_ = writers.output.Flush()
+		_ = writers.errors.Flush()
+		counts := progress.counts()
+		logger.V(logging.INFO).Info("Phase 2: system error, returning partial counts",
+			"total", counts.Total, "completed", counts.Completed, "failed", counts.Failed)
+		return counts, firstErr
 	}
 
 	if err := writers.output.Flush(); err != nil {
@@ -301,7 +309,7 @@ func (p *Processor) executeJob(
 // Semaphore acquisition order: local (per-model) before global (shared).
 // This prevents starving other models — blocking on global only wastes a local slot.
 //
-// Error strategy in this function: when a goroutine encounters a fatal error, firstErr is captured
+// Error strategy in this function: when a goroutine encounters a fatal error, modelErr is captured
 // via errOnce but the context is NOT cancelled within this function. Already-dispatched
 // goroutines run to completion. Context cancellation is propagated at the executeJob level
 // (execCancel), which stops dispatch across all models.
@@ -334,14 +342,14 @@ func (p *Processor) processModel(
 	var (
 		wg              sync.WaitGroup
 		errOnce         sync.Once
-		firstErr        error
+		modelErr        error
 		dispatchedCount int
 	)
 
 dispatch:
 	for i, entry := range entries {
 		if err := checkAbortCondition(ctx, cancelRequested); err != nil {
-			errOnce.Do(func() { firstErr = err })
+			errOnce.Do(func() { modelErr = err })
 			break
 		}
 
@@ -366,7 +374,7 @@ dispatch:
 			result, execErr := p.executeOneRequest(ctx, inputFile, entry, modelID, passThroughHeaders)
 			if execErr != nil {
 				logger.Error(execErr, "Fatal error executing request", "offset", entry.Offset)
-				errOnce.Do(func() { firstErr = execErr })
+				errOnce.Do(func() { modelErr = execErr })
 				return
 			}
 
@@ -383,7 +391,7 @@ dispatch:
 			lineBytes, marshalErr := json.Marshal(result)
 			if marshalErr != nil {
 				logger.Error(marshalErr, "Failed to marshal output line", "offset", entry.Offset)
-				errOnce.Do(func() { firstErr = fmt.Errorf("failed to marshal output line: %w", marshalErr) })
+				errOnce.Do(func() { modelErr = fmt.Errorf("failed to marshal output line: %w", marshalErr) })
 				return
 			}
 			lineBytes = append(lineBytes, '\n')
@@ -396,41 +404,70 @@ dispatch:
 					kind = "error"
 				}
 				logger.Error(writeErr, "Failed to write line", "kind", kind, "offset", entry.Offset)
-				errOnce.Do(func() { firstErr = fmt.Errorf("failed to write %s line: %w", kind, writeErr) })
+				errOnce.Do(func() { modelErr = fmt.Errorf("failed to write %s line: %w", kind, writeErr) })
 			}
 		}(entry)
 	}
 
 	wg.Wait()
 
-	// If the SLO deadline fired (not a user cancel), drain undispatched entries to the error file
-	// as "batch_expired" so partial results are preserved per OpenAI batch spec.
+	// Drain undispatched entries to the error file based on the termination reason.
+	// Priority: SLO expiry > user cancel > system error.
 	// Use sloCtx.Err() rather than ctx.Err(): ctx (execCtx) may report Canceled if execCancel()
 	// was called by another goroutine before the sloCtx deadline propagated.
-	if sloCtx.Err() == context.DeadlineExceeded && !cancelRequested.Load() {
+	// (Same rationale as the sloCtx check in executeJob.)
+	switch {
+	case sloCtx.Err() == context.DeadlineExceeded && !cancelRequested.Load():
+		// SLO deadline fired during dispatch — record remaining requests as expired.
 		undispatched := entries[dispatchedCount:]
 		if len(undispatched) > 0 {
 			logger.V(logging.INFO).Info("SLO expired: draining undispatched entries", "count", len(undispatched))
-			p.drainUndispatchedAsExpired(ctx, inputFile, undispatched, writers, progress)
+			p.drainUnprocessedRequests(ctx, inputFile, undispatched, writers, progress,
+				batch_types.ErrCodeBatchExpired,
+				"This request could not be executed before the completion window expired.")
+		}
+
+	case cancelRequested.Load():
+		// User-initiated cancel — record remaining requests as cancelled.
+		undispatched := entries[dispatchedCount:]
+		if len(undispatched) > 0 {
+			logger.V(logging.INFO).Info("Cancelled: draining undispatched entries", "count", len(undispatched))
+			p.drainUnprocessedRequests(ctx, inputFile, undispatched, writers, progress,
+				batch_types.ErrCodeBatchCancelled,
+				"This request was not executed because the batch was cancelled.")
+		}
+
+	case modelErr != nil:
+		// System error in a model goroutine — record remaining requests as failed.
+		undispatched := entries[dispatchedCount:]
+		if len(undispatched) > 0 {
+			logger.V(logging.INFO).Info("Fatal error: draining undispatched entries", "count", len(undispatched))
+			p.drainUnprocessedRequests(ctx, inputFile, undispatched, writers, progress,
+				batch_types.ErrCodeBatchFailed,
+				"This request was not executed because the batch encountered a system error.")
 		}
 	}
 
-	if firstErr == nil && ctx.Err() != nil {
-		firstErr = ctx.Err()
+	if modelErr == nil && ctx.Err() != nil {
+		modelErr = ctx.Err()
 	}
 
-	logger.V(logging.INFO).Info("Finished processing model", "numEntries", len(entries), "hasError", firstErr != nil)
-	return firstErr
+	logger.V(logging.INFO).Info("Finished processing model", "numEntries", len(entries), "hasError", modelErr != nil)
+	return modelErr
 }
 
-// drainUndispatchedAsExpired writes plan entries that were never dispatched to the error file
-// with error code "batch_expired". Called after the SLO deadline fires mid-execution.
-func (p *Processor) drainUndispatchedAsExpired(
+// drainUnprocessedRequests records undispatched requests in the error file when a job terminates
+// mid-execution (SLO expiry, cancellation, or systemic failure). For each plan entry, it reads
+// the original request from input.jsonl to extract the custom_id, then writes an error line with
+// the given error code and message.
+func (p *Processor) drainUnprocessedRequests(
 	ctx context.Context,
 	inputFile *os.File,
 	entries []planEntry,
 	writers *outputWriters,
 	progress *executionProgress,
+	errCode string,
+	errMessage string,
 ) {
 	logger := klog.FromContext(ctx)
 
@@ -444,7 +481,6 @@ func (p *Processor) drainUndispatchedAsExpired(
 	buf := make([]byte, maxLen)
 
 	for _, entry := range entries {
-		// Read the input line to extract custom_id; best-effort (empty string if unreadable).
 		customID := ""
 		if _, err := inputFile.ReadAt(buf[:entry.Length], entry.Offset); err == nil {
 			var req batch_types.Request
@@ -459,25 +495,25 @@ func (p *Processor) drainUndispatchedAsExpired(
 			ID:       newBatchRequestID(requestID),
 			CustomID: customID,
 			Error: &outputError{
-				Code:    errCodeBatchExpired,
-				Message: "This request could not be executed before the completion window expired.",
+				Code:    errCode,
+				Message: errMessage,
 			},
 		}
 
 		lineBytes, err := json.Marshal(line)
 		if err != nil {
-			logger.Error(err, "Failed to marshal batch_expired entry", "offset", entry.Offset)
+			logger.Error(err, "Failed to marshal drain entry", "errCode", errCode, "offset", entry.Offset)
 			continue
 		}
 		lineBytes = append(lineBytes, '\n')
 
 		if writeErr := writers.write(lineBytes, true); writeErr != nil {
-			logger.Error(writeErr, "Failed to write batch_expired entry", "offset", entry.Offset)
+			logger.Error(writeErr, "Failed to write drain entry", "errCode", errCode, "offset", entry.Offset)
 		}
 
-		// ctx is cancelled here (SLO deadline fired), so the Redis progress update inside
-		// record() will fail silently. The atomic counter still increments correctly and
-		// the final counts are committed by UpdateExpiredStatus after drain completes.
+		// Context may be cancelled here (e.g. SLO deadline fired), so the Redis progress
+		// update inside record() may fail silently. The atomic counter still increments
+		// correctly and the final counts are committed by the terminal status update.
 		progress.record(ctx, false)
 	}
 }
@@ -660,11 +696,7 @@ func (p *Processor) finalizeJob(
 		return fmt.Errorf("failed to update job status to completed: %w", err)
 	}
 
-	uotel.SetAttr(ctx,
-		attribute.Int64(uotel.AttrRequestTotal, requestCounts.Total),
-		attribute.Int64(uotel.AttrRequestCompleted, requestCounts.Completed),
-		attribute.Int64(uotel.AttrRequestFailed, requestCounts.Failed),
-	)
+	setRequestCountAttrs(ctx, requestCounts)
 
 	logger.V(logging.INFO).Info("Phase 3: finalization completed", "outputFileID", outputFileID, "errorFileID", errorFileID)
 	return nil
