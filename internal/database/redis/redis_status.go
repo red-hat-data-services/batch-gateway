@@ -24,10 +24,11 @@ import (
 	"fmt"
 	"time"
 
+	goredis "github.com/redis/go-redis/v9"
 	"k8s.io/klog/v2"
 )
 
-func (c *BatchDSClientRedis) StatusSet(ctx context.Context, ID string, TTL int, data []byte) (err error) {
+func (c *ExchangeDBClientRedis) StatusSet(ctx context.Context, ID string, TTL int, data []byte) (err error) {
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -44,10 +45,13 @@ func (c *BatchDSClientRedis) StatusSet(ctx context.Context, ID string, TTL int, 
 		logger.Error(err, "StatusSet:")
 		return
 	}
+	if TTL <= 0 {
+		TTL = ttlSecDefault
+	}
 
 	cctx, ccancel := context.WithTimeout(ctx, c.timeout)
 	defer ccancel()
-	res := c.redisClient.SetEx(cctx, getKeyForStatus(ID), data, time.Duration(int64(TTL)*int64(time.Second)))
+	res := c.redisClient.Set(cctx, getKeyForStatus(ID), data, time.Duration(TTL)*time.Second)
 	if res == nil {
 		err = fmt.Errorf("nil redis command result")
 		logger.Error(err, "StatusSet:")
@@ -63,7 +67,7 @@ func (c *BatchDSClientRedis) StatusSet(ctx context.Context, ID string, TTL int, 
 	return
 }
 
-func (c *BatchDSClientRedis) StatusGet(ctx context.Context, ID string) (data []byte, err error) {
+func (c *ExchangeDBClientRedis) StatusGet(ctx context.Context, ID string) (data []byte, err error) {
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -84,18 +88,21 @@ func (c *BatchDSClientRedis) StatusGet(ctx context.Context, ID string) (data []b
 		logger.Error(err, "StatusGet:")
 		return
 	}
-	if err = res.Err(); err != nil {
+	if res.Err() == goredis.Nil {
+		logger.Info("StatusGet: no status")
+		return
+	} else if err = res.Err(); err != nil {
 		logger.Error(err, "StatusGet: redis command error")
 		return
 	}
-	data = []byte(res.Val())
 
+	data = []byte(res.Val())
 	logger.Info("StatusGet: succeeded", "len(data)", len(data))
 
 	return
 }
 
-func (c *BatchDSClientRedis) StatusDelete(ctx context.Context, ID string) (nDeleted int, err error) {
+func (c *ExchangeDBClientRedis) StatusDelete(ctx context.Context, ID string) (nDeleted int, err error) {
 
 	if ctx == nil {
 		ctx = context.Background()

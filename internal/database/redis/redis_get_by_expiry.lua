@@ -17,25 +17,37 @@
 -- Parse inputs.
 local expTime = tonumber(ARGV[1])
 local pattern = ARGV[2]
-local getStatic = ARGV[3]
-local cursor = ARGV[4]
-local count = ARGV[5]
+local cursor = ARGV[3]
+local count = ARGV[4]
+local tenantID = ARGV[5]
+local includeSpec = ARGV[6]
+
+-- Check inputs.
+local result = {}
+if expTime <= 0 then
+	return {0, result}
+end
+
+-- Pre-compute boolean to avoid string comparison in loop.
+local shouldFilterSpec = (includeSpec == "false")
 
 -- Get the keys for the current iteration.
 local scan_out = redis.call('SCAN', cursor, 'TYPE', 'hash', 'MATCH', pattern, 'COUNT', count)
 
 -- Iterate over the keys.
-local result = {}
 for _, key in ipairs(scan_out[2]) do
 	-- Get the key's contents.
-	local contents
-	if getStatic == 'true' then
-		contents = redis.call('HMGET', key, "id", "expiry", "tags", "status", "spec")
-	else
-		contents = redis.call('HMGET', key, "id", "expiry", "tags", "status")
-	end
-	-- Check for expiry condition.
-	if tonumber(contents[2]) <= expTime then
+	local contents = redis.call('HGETALL', key)
+	-- Create a map of the contents.
+	local hash = contents_to_hash(contents)
+	-- Check inclusion condition.
+	local expVal = tonumber(hash["expiry"])
+	if expVal and (expVal <= expTime) and (tenantID == nil or tenantID == '' or tenantID == hash["tenantID"]) then
+		-- Remove spec field if needed.
+		if shouldFilterSpec then
+			contents = remove_spec_field(contents)
+		end
+		-- Add the item to the result.
 		table.insert(result, contents)
 	end
 end

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/batch"
@@ -31,38 +32,129 @@ import (
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/health"
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/metrics"
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/middleware"
-	mockdb "github.com/llm-d-incubation/batch-gateway/internal/database/mock"
-	mockfiles "github.com/llm-d-incubation/batch-gateway/internal/files_store/mock"
+	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/readiness"
+	"github.com/llm-d-incubation/batch-gateway/internal/util/clientset"
+	uredis "github.com/llm-d-incubation/batch-gateway/internal/util/redis"
 	"k8s.io/klog/v2"
 )
 
 type Server struct {
-	logger klog.Logger
-	config *common.ServerConfig
+	logger      klog.Logger
+	config      *common.ServerConfig
+	serverReady *atomic.Bool
+	apiHandler  http.Handler
+	obsHandler  http.Handler
+	clients     *clientset.Clientset
 }
 
-func New(config *common.ServerConfig) (*Server, error) {
+func buildClients(ctx context.Context, config *common.ServerConfig) (*clientset.Clientset, error) {
+	logger := klog.FromContext(ctx)
+
+	redisCfg := &uredis.RedisClientConfig{
+		ServiceName:   "batch-apiserver",
+		EnableTracing: config.OTel.RedisTracing,
+	}
+
+	config.PostgreSQLCfg.EnableTracing = config.OTel.PostgresqlTracing
+
+	clients, err := clientset.NewClientset(
+		ctx,
+		config.DatabaseType,
+		&config.PostgreSQLCfg,
+		redisCfg,
+		config.FileClientCfg.Type,
+		&config.FileClientCfg.FSConfig,
+		&config.FileClientCfg.S3Config,
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create clients: %w", err)
+	}
+	logger.Info("clients initialized")
+
+	return clients, nil
+}
+
+func New(ctx context.Context, config *common.ServerConfig) (*Server, error) {
 	if config == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
 	logger := klog.Background().WithName("api_server")
-	return &Server{config: config, logger: logger}, nil
+	serverReady := &atomic.Bool{}
+	serverReady.Store(false)
+
+	// build clients
+	clients, err := buildClients(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+
+	// API mux: business endpoints only
+	apiMux := http.NewServeMux()
+	fileHandler := file.NewFileAPIHandler(config, clients)
+	batchHandler := batch.NewBatchAPIHandler(config, clients)
+	for _, h := range []common.ApiHandler{fileHandler, batchHandler} {
+		common.RegisterHandler(apiMux, h)
+	}
+
+	// apply middlewares to the API handler
+	var apiHandler http.Handler = apiMux
+	apiHandler = middleware.SecurityHeadersMiddleware(apiHandler)
+	apiHandler = middleware.RequestMiddleware(config)(apiHandler)
+	apiHandler = middleware.RecoveryMiddleware(apiHandler)
+
+	// Observability mux: health, readiness, metrics (always plain HTTP)
+	obsMux := http.NewServeMux()
+	healthHandler := health.NewHealthApiHandler()
+	readinessHandler := readiness.NewReadinessApiHandler(serverReady)
+	metricsHandler := metrics.NewMetricsApiHandler()
+	for _, h := range []common.ApiHandler{healthHandler, readinessHandler, metricsHandler} {
+		common.RegisterHandler(obsMux, h)
+	}
+
+	return &Server{
+		config:      config,
+		logger:      logger,
+		serverReady: serverReady,
+		apiHandler:  apiHandler,
+		obsHandler:  obsMux,
+		clients:     clients,
+	}, nil
 }
 
-// Start the HTTP server.
+// Start the API server and the observability server.
 func (s *Server) Start(ctx context.Context) error {
 	logger := s.logger
 
+	// --- Observability server (always plain HTTP) ---
+	obsAddr := s.config.Host + ":" + s.config.ObservabilityPort
+	obsServer := &http.Server{
+		Addr:              obsAddr,
+		Handler:           s.obsHandler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		logger.Info("starting observability server", "addr", obsAddr)
+		if err := obsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error(err, "observability server failed")
+		}
+	}()
+
+	// --- API server ---
 	ln, err := net.Listen("tcp", s.config.Host+":"+s.config.Port)
 	if err != nil {
 		logger.Error(err, "failed to start")
 		return err
 	}
-
-	handler := s.buildHandler()
+	defer ln.Close()
 
 	httpserver := &http.Server{
-		Handler: handler,
+		Handler:           s.apiHandler,
+		ReadHeaderTimeout: time.Duration(s.config.GetReadHeaderTimeoutSeconds()) * time.Second,
+		ReadTimeout:       time.Duration(s.config.GetReadTimeoutSeconds()) * time.Second,
+		WriteTimeout:      time.Duration(s.config.GetWriteTimeoutSeconds()) * time.Second,
+		IdleTimeout:       time.Duration(s.config.GetIdleTimeoutSeconds()) * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MB
 	}
 
 	// Enable TLS if cert and key are provided
@@ -74,86 +166,89 @@ func (s *Server) Start(ctx context.Context) error {
 		httpserver.TLSConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-			},
 		}
-		s.logger.Info("server TLS configured")
+		s.logger.Info("API server TLS configured", "minVersion", "TLS 1.2")
 	} else if s.config.SSLCertFile != "" || s.config.SSLKeyFile != "" {
 		err := fmt.Errorf("both tls-cert-file and tls-private-key-file must be provided to enable TLS")
 		return err
 	}
 
-	// graceful termination
-	go func() {
-		<-ctx.Done()
-		logger.Info("shutting down")
+	logger.Info("starting API server", "addr", ln.Addr().String())
 
-		shutdownCtx, cancelFn := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancelFn()
-		if err := httpserver.Shutdown(shutdownCtx); err != nil {
-			logger.Error(err, "failed to gracefully shutdown")
+	// Start serving in a goroutine
+	serveDone := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error(nil, "server goroutine panicked", "panic", r)
+				serveDone <- fmt.Errorf("server panicked: %v", r)
+			}
+		}()
+		var err error
+		if s.config.SSLEnabled() {
+			err = httpserver.ServeTLS(ln, "", "")
 		} else {
-			logger.Info("shutdown complete")
+			err = httpserver.Serve(ln)
 		}
+		serveDone <- err
 	}()
 
-	logger.Info("starting", "addr", ln.Addr().String())
-	if s.config.SSLEnabled() {
-		if err := httpserver.ServeTLS(ln, "", ""); err != nil && err != http.ErrServerClosed {
-			logger.Error(err, "failed to start")
-			return err
+	// Wait for immediate startup failure or mark ready after 100ms
+	select {
+	case <-time.After(100 * time.Millisecond):
+		logger.Info("server is ready")
+		s.serverReady.Store(true)
+	case err := <-serveDone:
+		logger.Error(err, "server failed to start")
+		return err
+	case <-ctx.Done():
+		logger.Info("shutdown requested before server ready", "reason", ctx.Err())
+		return ctx.Err()
+	}
+
+	// Continue waiting for shutdown or failure after marking ready
+	select {
+	case <-ctx.Done():
+		// Normal shutdown path
+		s.serverReady.Store(false)
+		logger.Info("shutting down", "reason", ctx.Err())
+
+		// Gracefully shutdown both servers
+		shutdownCtx, cancelFn := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancelFn()
+
+		if err := obsServer.Shutdown(shutdownCtx); err != nil {
+			logger.Error(err, "failed to gracefully shutdown observability server")
 		}
-	} else {
-		if err := httpserver.Serve(ln); err != nil && err != http.ErrServerClosed {
-			logger.Error(err, "failed to start")
+		if err := httpserver.Shutdown(shutdownCtx); err != nil {
+			logger.Error(err, "failed to gracefully shutdown API server")
+		}
+
+		// Wait for server goroutine to finish with timeout
+		select {
+		case err = <-serveDone:
+			if err != nil && err != http.ErrServerClosed {
+				logger.Error(err, "server exited with error after shutdown")
+				return err
+			}
+		case <-time.After(5 * time.Second):
+			logger.Error(nil, "timeout waiting for server goroutine to exit")
+			return fmt.Errorf("server goroutine did not exit after shutdown")
+		}
+
+		if err := s.clients.Close(); err != nil {
+			logger.Error(err, "failed to close clients")
+		}
+		logger.Info("shutdown complete")
+
+	case err := <-serveDone:
+		// Server failed after becoming ready
+		s.serverReady.Store(false)
+		if err != nil && err != http.ErrServerClosed {
+			logger.Error(err, "server exited unexpectedly")
 			return err
 		}
 	}
 
 	return nil
-}
-
-func (s *Server) buildHandler() http.Handler {
-	mux := http.NewServeMux()
-
-	// TODO: change to actual implementation
-	dbClient := mockdb.NewMockBatchDBClient()
-	eventClient := mockdb.NewMockBatchEventChannelClient()
-	queueClient := mockdb.NewMockBatchPriorityQueueClient()
-	statusClient := mockdb.NewMockBatchStatusClient()
-	filesClient := mockfiles.NewMockBatchFilesClient()
-
-	// register handlers
-	healthHandler := health.NewHealthApiHandler()
-	metricsHandler := metrics.NewMetricsApiHandler()
-	fileHandler := file.NewFileApiHandler(s.config, dbClient, filesClient)
-	batchHandler := batch.NewBatchApiHandler(s.config, dbClient, queueClient, eventClient, statusClient)
-
-	handlers := []common.ApiHandler{
-		healthHandler,
-		metricsHandler,
-		fileHandler,
-		batchHandler,
-	}
-	for _, c := range handlers {
-		common.RegisterHandler(mux, c)
-	}
-
-	// register middlewares
-	var h http.Handler = mux
-	//h = middleware.BodySizeLimitMiddleware(h) //  Limit request body size
-	//h = middleware.AuthorizationMiddleware(h) //  Check permissions
-	//h = middleware.AuthenticationMiddleware(h) // Verify API key/JWT
-	//h = middleware.RateLimitMiddleware(h)      // Early Rejection
-	h = middleware.SecurityHeadersMiddleware(h)   // Add security headers
-	h = middleware.RequestMiddleware(s.config)(h) // 2nd Outermost, request monitoring with tenant support
-	h = middleware.RecoveryMiddleware(h)          // Outermost - catches ALL panics
-
-	return h
 }

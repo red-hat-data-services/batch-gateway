@@ -32,8 +32,10 @@ import (
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/common"
 	dbapi "github.com/llm-d-incubation/batch-gateway/internal/database/api"
 	dbmock "github.com/llm-d-incubation/batch-gateway/internal/database/mock"
-	fsmock "github.com/llm-d-incubation/batch-gateway/internal/files_store/mock"
+	fsclient "github.com/llm-d-incubation/batch-gateway/internal/files_store/fs"
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
+	"github.com/llm-d-incubation/batch-gateway/internal/util/clientset"
+	ucom "github.com/llm-d-incubation/batch-gateway/internal/util/com"
 	"k8s.io/klog/v2"
 )
 
@@ -49,31 +51,44 @@ func TestFileHandler(t *testing.T) {
 }
 
 // setupTestHandler creates a test handler with mocked dependencies
-func setupTestHandler(t *testing.T) (*FileApiHandler, *dbmock.MockBatchDBClient, *fsmock.MockBatchFilesClient, context.Context) {
+func setupTestHandler(t *testing.T) *FileAPIHandler {
 	t.Helper()
 
-	dbClient := dbmock.NewMockBatchDBClient()
-	filesClient := fsmock.NewMockBatchFilesClient()
+	filesClient, err := fsclient.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to create fs client: %v", err)
+	}
+	dbClient := dbmock.NewMockDBClient[dbapi.FileItem, dbapi.FileQuery](
+		func(f *dbapi.FileItem) string { return f.ID },
+		func(q *dbapi.FileQuery) *dbapi.BaseQuery { return &q.BaseQuery },
+	)
+	clients := &clientset.Clientset{
+		Inference: nil,
+		File:      filesClient,
+		BatchDB:   nil,
+		FileDB:    dbClient,
+		Queue:     nil,
+		Event:     nil,
+		Status:    nil,
+	}
+
+	t.Cleanup(func() { _ = filesClient.Close() })
 
 	config := &common.ServerConfig{
-		FilesAPI: common.FilesAPIConfig{
+		FileAPI: common.FileAPIConfig{
 			MaxSizeBytes:             common.DefaultMaxFileSizeBytes,
 			MaxLineCount:             common.DefaultMaxFileLineCount,
 			DefaultExpirationSeconds: 30 * 24 * 60 * 60, // 30 days (test value)
 		},
 	}
 
-	handler := NewFileApiHandler(config, dbClient, filesClient)
+	handler := NewFileAPIHandler(config, clients)
 
-	ctx := context.Background()
-	logger := klog.FromContext(ctx)
-	ctx = klog.NewContext(ctx, logger)
-
-	return handler, dbClient, filesClient, ctx
+	return handler
 }
 
 // createTestFile is a helper function that creates a test file and returns the created FileObject.
-func createTestFile(t *testing.T, handler *FileApiHandler, ctx context.Context, filename, purpose, content string) openai.FileObject {
+func createTestFile(t *testing.T, handler *FileAPIHandler, ctx context.Context, filename, purpose, content string) openai.FileObject {
 	t.Helper()
 
 	body := &bytes.Buffer{}
@@ -115,14 +130,20 @@ func createTestFile(t *testing.T, handler *FileApiHandler, ctx context.Context, 
 }
 
 func doTestCreateFile(t *testing.T) {
-	handler, dbClient, filesClient, ctx := setupTestHandler(t)
+	t.Run("Success", doTestCreateFileSuccess)
+	t.Run("ExpiresAfterValidation", doTestCreateFileExpiresAfter)
+}
+
+func doTestCreateFileSuccess(t *testing.T) {
+	ctx := context.Background()
+	handler := setupTestHandler(t)
 
 	// Test file content - each line will get a newline appended by scanner during storage
 	testLines := []string{
 		`{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}`,
 		`{"custom_id":"request-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"World"}]}}`,
 	}
-	fileContent := strings.Join(testLines, "\n")
+	fileContent := strings.Join(testLines, "\n") + "\n"
 
 	// Calculate expected size after scanner processing (each line gets a newline appended)
 	expectedBytes := int64(0)
@@ -160,9 +181,9 @@ func doTestCreateFile(t *testing.T) {
 	}
 
 	// Verify file was stored in DB
-	items, _, _, err := dbClient.DBGet(ctx, &dbapi.BatchDBQuery{
-		IDs: []string{fileObj.ID},
-	}, false, 0, 10)
+	items, _, _, err := handler.clients.FileDB.DBGet(ctx, &dbapi.FileQuery{
+		BaseQuery: dbapi.BaseQuery{IDs: []string{fileObj.ID}},
+	}, true, 0, 10)
 	if err != nil {
 		t.Fatalf("failed to get file from DB: %v", err)
 	}
@@ -172,16 +193,14 @@ func doTestCreateFile(t *testing.T) {
 	if items[0].ID != fileObj.ID {
 		t.Errorf("expected DB item ID '%s', got '%s'", fileObj.ID, items[0].ID)
 	}
-	if items[0].Expiry != fileObj.ExpiresAt {
-		t.Errorf("expected DB expiry %d, got %d", fileObj.ExpiresAt, items[0].Expiry)
-	}
 
 	// Verify file was actually uploaded to storage
-	// Mock stores files at /tmp/batch-gateway-files/{folderName}/{fileName}
-	// folderName is empty string, so location is just the filename
 	fileName := fileObj.Filename
-	folderName := ""
-	fileReader, fileMeta, err := filesClient.Retrieve(ctx, fileName, folderName)
+	folderName, err := ucom.GetFolderNameByTenantID(common.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("failed to get folder name from tenant ID: %v", err)
+	}
+	fileReader, fileMeta, err := handler.clients.File.Retrieve(ctx, fileName, folderName)
 	if err != nil {
 		t.Fatalf("failed to retrieve file from storage: %v", err)
 	}
@@ -206,8 +225,85 @@ func doTestCreateFile(t *testing.T) {
 	}
 }
 
+func doTestCreateFileExpiresAfter(t *testing.T) {
+	ctx := context.Background()
+	handler := setupTestHandler(t)
+	fileContent := `{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}`
+
+	buildRequest := func(name, anchor, seconds string) *http.Request {
+		body := &bytes.Buffer{}
+		writer := multipart.NewWriter(body)
+
+		fileWriter, err := writer.CreateFormFile("file", name+".jsonl")
+		if err != nil {
+			t.Fatalf("failed to create form file: %v", err)
+		}
+		if _, err := io.WriteString(fileWriter, fileContent); err != nil {
+			t.Fatalf("failed to write file content: %v", err)
+		}
+		if err := writer.WriteField("purpose", "batch"); err != nil {
+			t.Fatalf("failed to write purpose field: %v", err)
+		}
+		if anchor != "" {
+			if err := writer.WriteField("expires_after[anchor]", anchor); err != nil {
+				t.Fatalf("failed to write anchor field: %v", err)
+			}
+		}
+		if seconds != "" {
+			if err := writer.WriteField("expires_after[seconds]", seconds); err != nil {
+				t.Fatalf("failed to write seconds field: %v", err)
+			}
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatalf("failed to close multipart writer: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/v1/files", body)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		return req.WithContext(ctx)
+	}
+
+	tests := []struct {
+		name           string
+		anchor         string
+		seconds        string
+		expectedStatus int
+	}{
+		{"valid min boundary", "created_at", "3600", http.StatusOK},
+		{"valid max boundary", "created_at", "2592000", http.StatusOK},
+		{"valid mid range", "created_at", "86400", http.StatusOK},
+		{"too small", "created_at", "3599", http.StatusBadRequest},
+		{"too large", "created_at", "2592001", http.StatusBadRequest},
+		{"negative", "created_at", "-1", http.StatusBadRequest},
+		{"zero", "created_at", "0", http.StatusBadRequest},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := buildRequest(tc.name, tc.anchor, tc.seconds)
+			w := httptest.NewRecorder()
+			handler.CreateFile(w, req)
+
+			if w.Code != tc.expectedStatus {
+				t.Errorf("expected status %d, got %d, body: %s", tc.expectedStatus, w.Code, w.Body.String())
+			}
+
+			if tc.expectedStatus == http.StatusOK {
+				var fileObj openai.FileObject
+				if err := json.Unmarshal(w.Body.Bytes(), &fileObj); err != nil {
+					t.Fatalf("failed to parse response: %v", err)
+				}
+				if fileObj.ExpiresAt <= fileObj.CreatedAt {
+					t.Errorf("expected expiresAt > createdAt, got expiresAt=%d, createdAt=%d", fileObj.ExpiresAt, fileObj.CreatedAt)
+				}
+			}
+		})
+	}
+}
+
 func doTestListFiles(t *testing.T) {
-	handler, _, _, ctx := setupTestHandler(t)
+	ctx := context.Background()
+	handler := setupTestHandler(t)
 
 	// Create multiple test files with different purposes
 	testFiles := []struct {
@@ -279,37 +375,7 @@ func doTestListFiles(t *testing.T) {
 		}
 	})
 
-	// Test 2: Filter by purpose=batch
-	t.Run("FilterByPurpose", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/v1/files?purpose=batch", nil)
-		req = req.WithContext(ctx)
-
-		w := httptest.NewRecorder()
-		handler.ListFiles(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Errorf("expected status %d, got %d", http.StatusOK, w.Code)
-		}
-
-		var listResp openai.ListFilesResponse
-		if err := json.Unmarshal(w.Body.Bytes(), &listResp); err != nil {
-			t.Fatalf("failed to parse list response: %v", err)
-		}
-
-		// Should only return batch purpose files
-		expectedCount := 2 // batch-file-1 and batch-file-2
-		if len(listResp.Data) != expectedCount {
-			t.Errorf("expected %d batch files, got %d", expectedCount, len(listResp.Data))
-		}
-
-		for _, file := range listResp.Data {
-			if file.Purpose != openai.FileObjectPurposeBatch {
-				t.Errorf("expected purpose 'batch', got '%s' for file %s", file.Purpose, file.ID)
-			}
-		}
-	})
-
-	// Test 3: Test limit parameter
+	// Test 2: Test limit parameter
 	t.Run("LimitParameter", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/v1/files?limit=1", nil)
 		req = req.WithContext(ctx)
@@ -424,7 +490,8 @@ func doTestListFiles(t *testing.T) {
 }
 
 func doTestRetrieveFile(t *testing.T) {
-	handler, _, _, ctx := setupTestHandler(t)
+	ctx := context.Background()
+	handler := setupTestHandler(t)
 
 	// Create a test file using helper
 	testContent := `{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{}}`
@@ -433,7 +500,7 @@ func doTestRetrieveFile(t *testing.T) {
 	// Test 1: Retrieve existing file
 	t.Run("RetrieveExistingFile", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/v1/files/"+createdFile.ID, nil)
-		req.SetPathValue(pathParamFileID, createdFile.ID)
+		req.SetPathValue(common.PathParamFileID, createdFile.ID)
 		req = req.WithContext(ctx)
 
 		w := httptest.NewRecorder()
@@ -480,7 +547,7 @@ func doTestRetrieveFile(t *testing.T) {
 	t.Run("RetrieveNonExistentFile", func(t *testing.T) {
 		nonExistentID := "file_nonexistent"
 		req := httptest.NewRequest(http.MethodGet, "/v1/files/"+nonExistentID, nil)
-		req.SetPathValue(pathParamFileID, nonExistentID)
+		req.SetPathValue(common.PathParamFileID, nonExistentID)
 		req = req.WithContext(ctx)
 
 		w := httptest.NewRecorder()
@@ -522,20 +589,21 @@ func doTestRetrieveFile(t *testing.T) {
 }
 
 func doTestDownloadFile(t *testing.T) {
-	handler, _, _, ctx := setupTestHandler(t)
+	ctx := context.Background()
+	handler := setupTestHandler(t)
 
 	// Create a test file with specific content using helper
 	testLines := []string{
 		`{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{}}`,
 		`{"custom_id":"req-2","method":"POST","url":"/v1/chat/completions","body":{}}`,
 	}
-	testContent := strings.Join(testLines, "\n")
+	testContent := strings.Join(testLines, "\n") + "\n"
 	createdFile := createTestFile(t, handler, ctx, "test-download.jsonl", "batch", testContent)
 
 	// Test 1: Download existing file
 	t.Run("DownloadExistingFile", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/v1/files/"+createdFile.ID+"/content", nil)
-		req.SetPathValue(pathParamFileID, createdFile.ID)
+		req.SetPathValue(common.PathParamFileID, createdFile.ID)
 		req = req.WithContext(ctx)
 
 		w := httptest.NewRecorder()
@@ -582,7 +650,7 @@ func doTestDownloadFile(t *testing.T) {
 	t.Run("DownloadNonExistentFile", func(t *testing.T) {
 		nonExistentID := "file_nonexistent"
 		req := httptest.NewRequest(http.MethodGet, "/v1/files/"+nonExistentID+"/content", nil)
-		req.SetPathValue(pathParamFileID, nonExistentID)
+		req.SetPathValue(common.PathParamFileID, nonExistentID)
 		req = req.WithContext(ctx)
 
 		w := httptest.NewRecorder()
@@ -609,7 +677,8 @@ func doTestDownloadFile(t *testing.T) {
 }
 
 func doTestDeleteFile(t *testing.T) {
-	handler, dbClient, filesClient, ctx := setupTestHandler(t)
+	ctx := context.Background()
+	handler := setupTestHandler(t)
 
 	// Create a test file using helper
 	testLines := []string{
@@ -622,7 +691,7 @@ func doTestDeleteFile(t *testing.T) {
 	// Test 1: Delete existing file
 	t.Run("DeleteExistingFile", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodDelete, "/v1/files/"+createdFile.ID, nil)
-		req.SetPathValue(pathParamFileID, createdFile.ID)
+		req.SetPathValue(common.PathParamFileID, createdFile.ID)
 		req = req.WithContext(ctx)
 
 		w := httptest.NewRecorder()
@@ -652,8 +721,8 @@ func doTestDeleteFile(t *testing.T) {
 		}
 
 		// Verify file is actually deleted from database
-		items, _, _, err := dbClient.DBGet(ctx, &dbapi.BatchDBQuery{
-			IDs: []string{createdFile.ID},
+		items, _, _, err := handler.clients.FileDB.DBGet(ctx, &dbapi.FileQuery{
+			BaseQuery: dbapi.BaseQuery{IDs: []string{createdFile.ID}},
 		}, true, 0, 1)
 		if err != nil {
 			t.Fatalf("failed to query database: %v", err)
@@ -664,7 +733,11 @@ func doTestDeleteFile(t *testing.T) {
 		}
 
 		// Verify physical file is deleted from storage
-		_, _, err = filesClient.Retrieve(ctx, createdFile.Filename, "")
+		folderName, err := ucom.GetFolderNameByTenantID(common.DefaultTenantID)
+		if err != nil {
+			t.Fatalf("failed to get folder name from tenant ID: %v", err)
+		}
+		_, _, err = handler.clients.File.Retrieve(ctx, createdFile.Filename, folderName)
 		if err == nil {
 			t.Errorf("expected physical file to be deleted, but still exists")
 		}
@@ -674,7 +747,7 @@ func doTestDeleteFile(t *testing.T) {
 	t.Run("DeleteNonExistentFile", func(t *testing.T) {
 		nonExistentID := "file_nonexistent"
 		req := httptest.NewRequest(http.MethodDelete, "/v1/files/"+nonExistentID, nil)
-		req.SetPathValue(pathParamFileID, nonExistentID)
+		req.SetPathValue(common.PathParamFileID, nonExistentID)
 		req = req.WithContext(ctx)
 
 		w := httptest.NewRecorder()

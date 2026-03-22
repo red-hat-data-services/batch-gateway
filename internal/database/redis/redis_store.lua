@@ -16,24 +16,41 @@
 
 -- Parse inputs.
 local hashKey = KEYS[1]
-local fieldVer = ARGV[1]
-local fieldId = ARGV[2]
-local fieldExpiry = tonumber(ARGV[3])
-local fieldTags = ARGV[4]
-local fieldStatus = ARGV[5]
-local fieldSpec = ARGV[6]
-local ttl = tonumber(ARGV[7])
+local fieldItemType = ARGV[1]
+local fieldVer = ARGV[2]
+local fieldID = ARGV[3]
+local fieldTenantID = ARGV[4]
+local fieldExpiry = tonumber(ARGV[5])
+local fieldTags = ARGV[6]
+local fieldStatus = ARGV[7]
+local fieldSpec = ARGV[8]
+local ttl = tonumber(ARGV[9])
+local fieldPurpose = ARGV[10]
 
--- Add the hash key.
-redis.call('HSET', hashKey, "ver", fieldVer,
-    "id", fieldId, "expiry", fieldExpiry, "tags", fieldTags,
-    "status", fieldStatus, "spec", fieldSpec)
+if fieldItemType == 'batch' then
+    -- Add the hash key.
+    redis.call('HSET', hashKey, "ver", fieldVer,
+        "ID", fieldID, "tenantID", fieldTenantID, "expiry", fieldExpiry, "tags", fieldTags,
+        "status", fieldStatus, "spec", fieldSpec)
 
--- Set expiration.
-local result = redis.pcall('EXPIRE', hashKey, ttl)
-if type(result) == 'table' and result.err then
-    redis.pcall('HDEL', hashKey, "ver", "id", "expiry", "tags", "status", "spec")
-    return result.err
+    -- Set expiration.
+    local result = redis.pcall('EXPIRE', hashKey, ttl)
+    if type(result) == 'table' and result.err then
+        redis.pcall('DEL', hashKey)
+        return result.err
+    end
+else
+    -- Add the hash key.
+    redis.call('HSET', hashKey, "ver", fieldVer,
+        "ID", fieldID, "tenantID", fieldTenantID, "expiry", fieldExpiry, "tags", fieldTags,
+        "status", fieldStatus, "spec", fieldSpec, "purpose", fieldPurpose)
+
+    -- Set expiration.
+    local result = redis.pcall('EXPIRE', hashKey, ttl)
+    if type(result) == 'table' and result.err then
+        redis.pcall('DEL', hashKey)
+        return result.err
+    end
 end
 
 return ''

@@ -22,6 +22,9 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/llm-d-incubation/batch-gateway/internal/database/postgresql"
+	fsclient "github.com/llm-d-incubation/batch-gateway/internal/files_store/fs"
+	s3client "github.com/llm-d-incubation/batch-gateway/internal/files_store/s3"
 	"gopkg.in/yaml.v3"
 	"k8s.io/klog/v2"
 )
@@ -31,28 +34,108 @@ const (
 	DefaultMaxFileSizeBytes = 200 << 20
 	// DefaultFileExpirationSeconds is the default file expiration time (90 days)
 	DefaultFileExpirationSeconds = 90 * 24 * 60 * 60 // 7776000 seconds
-	// DefaultBatchTTLSeconds is the default batch TTL (30 days)
-	DefaultBatchTTLSeconds = 30 * 24 * 60 * 60 // 2592000 seconds
+	// DefaultBatchEventTTLSeconds is the default batch event TTL (30 days)
+	DefaultBatchEventTTLSeconds = 30 * 24 * 60 * 60 // 2592000 seconds
 	// DefaultMaxFileLineCount is the default maximum number of lines per file
 	DefaultMaxFileLineCount = 50000
 	// DefaultTenantHeader is the default HTTP header name for tenant ID
-	DefaultTenantHeader = "X-MaaS-User"
+	DefaultTenantHeader = "X-MaaS-Username"
+
+	// HTTP server timeout defaults
+	// DefaultReadHeaderTimeoutSeconds prevents slow-client attacks (Slowloris)
+	DefaultReadHeaderTimeoutSeconds = 10
+	// DefaultReadTimeoutSeconds includes reading request headers and body
+	// Must accommodate large file uploads (up to 200MB)
+	// Supports upload speeds as low as ~2.8 Mbps
+	DefaultReadTimeoutSeconds = 900 // 15 minutes
+	// DefaultWriteTimeoutSeconds includes writing response
+	// Must accommodate large batch query results
+	DefaultWriteTimeoutSeconds = 120 // 2 minutes
+	// DefaultIdleTimeoutSeconds for keep-alive connections
+	DefaultIdleTimeoutSeconds = 90
 )
 
-type FilesAPIConfig struct {
+type BatchAPIConfig struct {
+	BatchEventTTLSeconds int      `yaml:"batch_event_ttl_seconds"`
+	PassThroughHeaders   []string `yaml:"pass_through_headers"`
+}
+
+func (b *BatchAPIConfig) applyDefaults() {
+	if b.BatchEventTTLSeconds <= 0 {
+		b.BatchEventTTLSeconds = DefaultBatchEventTTLSeconds
+	}
+}
+
+func (b *BatchAPIConfig) GetBatchEventTTLSeconds() int {
+	return b.BatchEventTTLSeconds
+}
+
+type FileAPIConfig struct {
 	DefaultExpirationSeconds int64 `yaml:"default_expiration_seconds"`
 	MaxSizeBytes             int64 `yaml:"max_size_bytes"`
 	MaxLineCount             int64 `yaml:"max_line_count"`
 }
 
+func (f *FileAPIConfig) applyDefaults() {
+	if f.DefaultExpirationSeconds <= 0 {
+		f.DefaultExpirationSeconds = DefaultFileExpirationSeconds
+	}
+	if f.MaxSizeBytes <= 0 {
+		f.MaxSizeBytes = DefaultMaxFileSizeBytes
+	}
+	if f.MaxLineCount <= 0 {
+		f.MaxLineCount = DefaultMaxFileLineCount
+	}
+}
+
+func (f *FileAPIConfig) GetDefaultExpirationSeconds() int64 {
+	return f.DefaultExpirationSeconds
+}
+
+func (f *FileAPIConfig) GetMaxSizeBytes() int64 {
+	return f.MaxSizeBytes
+}
+
+func (f *FileAPIConfig) GetMaxLineCount() int64 {
+	return f.MaxLineCount
+}
+
 type ServerConfig struct {
-	Host            string         `yaml:"host"`
-	Port            string         `yaml:"port"`
-	SSLCertFile     string         `yaml:"ssl_cert_file"`
-	SSLKeyFile      string         `yaml:"ssl_key_file"`
-	BatchTTLSeconds int            `yaml:"batch_ttl_seconds"`
-	TenantHeader    string         `yaml:"tenant_header"`
-	FilesAPI        FilesAPIConfig `yaml:"files_api"`
+	Host              string `yaml:"host"`
+	Port              string `yaml:"port"`
+	ObservabilityPort string `yaml:"observability_port"`
+	SSLCertFile       string `yaml:"ssl_cert_file"`
+	SSLKeyFile        string `yaml:"ssl_key_file"`
+	TenantHeader      string `yaml:"tenant_header"`
+
+	// HTTP server timeout configurations (in seconds)
+	ReadHeaderTimeoutSeconds int64 `yaml:"read_header_timeout_seconds"`
+	ReadTimeoutSeconds       int64 `yaml:"read_timeout_seconds"`
+	WriteTimeoutSeconds      int64 `yaml:"write_timeout_seconds"`
+	IdleTimeoutSeconds       int64 `yaml:"idle_timeout_seconds"`
+
+	// API endpoint configurations
+	BatchAPI BatchAPIConfig `yaml:"batch_api"`
+	FileAPI  FileAPIConfig  `yaml:"file_api"`
+
+	// Files client configuration
+	FileClientCfg struct {
+		Type     string          `yaml:"type"`
+		FSConfig fsclient.Config `yaml:"fs"`
+		S3Config s3client.Config `yaml:"s3"`
+	} `yaml:"file_client"`
+
+	// DatabaseType specifies the database backend: "mock", "redis", or "postgresql".
+	DatabaseType string `yaml:"database_type"`
+
+	// PostgreSQLCfg holds PostgreSQL connection settings (used when DatabaseType is "postgresql").
+	PostgreSQLCfg postgresql.PostgreSQLConfig `yaml:"postgresql"`
+
+	// OTel holds OpenTelemetry-related settings.
+	OTel struct {
+		RedisTracing      bool `yaml:"redis_tracing"`
+		PostgresqlTracing bool `yaml:"postgresql_tracing"`
+	} `yaml:"otel"`
 }
 
 func NewConfig() *ServerConfig {
@@ -75,6 +158,8 @@ func (c *ServerConfig) Load() error {
 	if err := c.loadFromFile(configFile); err != nil {
 		return err
 	}
+
+	c.applyDefaults()
 
 	return c.Validate()
 }
@@ -119,46 +204,52 @@ func (c *ServerConfig) loadFromFile(path string) error {
 	return nil
 }
 
+func (c *ServerConfig) applyDefaults() {
+	if c.ObservabilityPort == "" {
+		c.ObservabilityPort = "8081"
+	}
+	if c.DatabaseType == "" {
+		c.DatabaseType = "redis"
+	}
+	if c.TenantHeader == "" {
+		c.TenantHeader = DefaultTenantHeader
+	}
+	if c.ReadHeaderTimeoutSeconds <= 0 {
+		c.ReadHeaderTimeoutSeconds = DefaultReadHeaderTimeoutSeconds
+	}
+	if c.ReadTimeoutSeconds <= 0 {
+		c.ReadTimeoutSeconds = DefaultReadTimeoutSeconds
+	}
+	if c.WriteTimeoutSeconds <= 0 {
+		c.WriteTimeoutSeconds = DefaultWriteTimeoutSeconds
+	}
+	if c.IdleTimeoutSeconds <= 0 {
+		c.IdleTimeoutSeconds = DefaultIdleTimeoutSeconds
+	}
+	c.BatchAPI.applyDefaults()
+	c.FileAPI.applyDefaults()
+}
+
 func (c *ServerConfig) SSLEnabled() bool {
 	return (c.SSLCertFile != "" && c.SSLKeyFile != "")
 }
 
-func (c *ServerConfig) GetBatchTTLSeconds() int {
-	if c.BatchTTLSeconds > 0 {
-		return c.BatchTTLSeconds
-	}
-	// Default to 30 days if not configured
-	return DefaultBatchTTLSeconds
+func (c *ServerConfig) GetReadHeaderTimeoutSeconds() int64 {
+	return c.ReadHeaderTimeoutSeconds
 }
 
-func (c *ServerConfig) GetMaxFileSizeBytes() int64 {
-	if c.FilesAPI.MaxSizeBytes > 0 {
-		return c.FilesAPI.MaxSizeBytes
-	}
-	// The file can contain up to 50,000 requests, and can be up to 200 MB in size.
-	// Line counting is enforced via LineCountingReader in the file upload handler.
-	return DefaultMaxFileSizeBytes
+func (c *ServerConfig) GetReadTimeoutSeconds() int64 {
+	return c.ReadTimeoutSeconds
 }
 
-func (c *ServerConfig) GetFileDefaultExpirationSeconds() int64 {
-	if c.FilesAPI.DefaultExpirationSeconds > 0 {
-		return c.FilesAPI.DefaultExpirationSeconds
-	}
-	// Default to 90 days if not configured
-	return DefaultFileExpirationSeconds
+func (c *ServerConfig) GetWriteTimeoutSeconds() int64 {
+	return c.WriteTimeoutSeconds
 }
 
-func (c *ServerConfig) GetMaxFileLineCount() int64 {
-	if c.FilesAPI.MaxLineCount > 0 {
-		return c.FilesAPI.MaxLineCount
-	}
-	// Default to 50,000 lines if not configured
-	return DefaultMaxFileLineCount
+func (c *ServerConfig) GetIdleTimeoutSeconds() int64 {
+	return c.IdleTimeoutSeconds
 }
 
 func (c *ServerConfig) GetTenantHeader() string {
-	if c.TenantHeader != "" {
-		return c.TenantHeader
-	}
-	return DefaultTenantHeader
+	return c.TenantHeader
 }

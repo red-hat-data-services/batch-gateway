@@ -32,7 +32,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-func (c *BatchDSClientRedis) ECConsumerGetChannel(ctx context.Context, ID string) (
+func (c *ExchangeDBClientRedis) ECConsumerGetChannel(ctx context.Context, ID string) (
 	batchEventsChan *db_api.BatchEventsChan, err error) {
 
 	if ctx == nil {
@@ -73,9 +73,7 @@ func (c *BatchDSClientRedis) ECConsumerGetChannel(ctx context.Context, ID string
 				return
 			default:
 				logger.V(logging.DEBUG).Info("Listener: Start BLMPop")
-				lcctx, lccancel := context.WithTimeout(lctx, c.timeout+2*time.Second)
-				_, events, err := c.redisClient.BLMPop(lcctx, c.timeout, "left", int64(eventReadCount), eventsKeyId).Result()
-				lccancel()
+				_, events, err := c.redisClient.BLMPop(lctx, eventReadTimeout, "left", int64(eventReadCount), eventsKeyId).Result()
 				logger.V(logging.DEBUG).Info("Listener: Finished BLMPop")
 				if err != nil {
 					if unrecognizedBlockingError(err) {
@@ -117,7 +115,7 @@ func getKeyForEvent(key string) string {
 	return eventKeysPrefix + key
 }
 
-func (c *BatchDSClientRedis) ECProducerSendEvents(ctx context.Context, events []db_api.BatchEvent) (
+func (c *ExchangeDBClientRedis) ECProducerSendEvents(ctx context.Context, events []db_api.BatchEvent) (
 	sentIDs []string, err error) {
 
 	if ctx == nil {
@@ -145,7 +143,7 @@ func (c *BatchDSClientRedis) ECProducerSendEvents(ctx context.Context, events []
 			key := getKeyForEvent(event.ID)
 			res := pipe.RPush(cctx, key, eventTypeStr)
 			resMap[event.ID] = res
-			pipe.Expire(cctx, key, time.Duration(int64(event.TTL)*int64(time.Second)))
+			pipe.Expire(cctx, key, time.Duration(event.TTL)*time.Second)
 		}
 		return nil
 	})

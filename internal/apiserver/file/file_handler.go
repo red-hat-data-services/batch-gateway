@@ -19,7 +19,6 @@ limitations under the License.
 package file
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,114 +26,78 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/common"
 	dbapi "github.com/llm-d-incubation/batch-gateway/internal/database/api"
-	fsapi "github.com/llm-d-incubation/batch-gateway/internal/files_store/api"
+	"github.com/llm-d-incubation/batch-gateway/internal/shared/converter"
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
+	"github.com/llm-d-incubation/batch-gateway/internal/util/clientset"
+	ucom "github.com/llm-d-incubation/batch-gateway/internal/util/com"
 	"github.com/llm-d-incubation/batch-gateway/internal/util/logging"
+	uotel "github.com/llm-d-incubation/batch-gateway/internal/util/otel"
 )
 
 const (
-	pathParamFileID = "file_id"
+	defaultListFilesLimit = 10000
+	maxListFilesLimit     = 10000
 )
 
-type FileSpec struct {
-	Bytes       int64                    `json:"bytes"`
-	CreatedAt   int64                    `json:"created_at"`
-	ExpiresAt   int64                    `json:"expires_at"`
-	FolderName  string                   `json:"folder_name"`
-	Filename    string                   `json:"filename"`
-	Purpose     openai.FileObjectPurpose `json:"purpose"`
-	LinesNumber int64                    `json:"lines_number"`
-	ModTime     int64                    `json:"mod_time"`
+type FileAPIHandler struct {
+	config  *common.ServerConfig
+	clients *clientset.Clientset
 }
 
-type FileStatusInfo struct {
-	Status        openai.FileObjectStatus `json:"status,omitempty"`
-	StatusDetails string                  `json:"status_details,omitempty"`
-}
-
-type FileApiHandler struct {
-	config      *common.ServerConfig
-	dbClient    dbapi.BatchDBClient
-	filesClient fsapi.BatchFilesClient
-}
-
-func NewFileApiHandler(config *common.ServerConfig, dbClient dbapi.BatchDBClient, filesClient fsapi.BatchFilesClient) *FileApiHandler {
-	return &FileApiHandler{
-		config:      config,
-		dbClient:    dbClient,
-		filesClient: filesClient,
+func NewFileAPIHandler(config *common.ServerConfig, clients *clientset.Clientset) *FileAPIHandler {
+	return &FileAPIHandler{
+		config:  config,
+		clients: clients,
 	}
 }
 
-func (c *FileApiHandler) GetRoutes() []common.Route {
+func (c *FileAPIHandler) GetRoutes() []common.Route {
 	return []common.Route{
 		{
 			Method:      http.MethodPost,
 			Pattern:     "/v1/files",
 			HandlerFunc: c.CreateFile,
+			SpanName:    "api-create-file",
 		},
 		{
 			Method:      http.MethodGet,
 			Pattern:     "/v1/files",
 			HandlerFunc: c.ListFiles,
+			SpanName:    "api-list-file",
 		},
 		{
 			Method:      http.MethodGet,
 			Pattern:     "/v1/files/{file_id}",
 			HandlerFunc: c.RetrieveFile,
+			SpanName:    "api-get-file",
 		},
 		{
 			Method:      http.MethodGet,
 			Pattern:     "/v1/files/{file_id}/content",
 			HandlerFunc: c.DownloadFile,
+			SpanName:    "api-download-file",
 		},
 		{
 			Method:      http.MethodDelete,
 			Pattern:     "/v1/files/{file_id}",
 			HandlerFunc: c.DeleteFile,
+			SpanName:    "api-delete-file",
 		},
 	}
 }
 
-// itemToFileObject deserializes a BatchItem's Spec and Status fields into a FileObject.
-func (c *FileApiHandler) dbItemToFileObject(item *dbapi.BatchItem) (*openai.FileObject, error) {
-	fileSpec := &FileSpec{}
-	if err := json.Unmarshal(item.Spec, fileSpec); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal file spec: %w", err)
-	}
-
-	fileStatus := &FileStatusInfo{}
-	if err := json.Unmarshal(item.Status, fileStatus); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal file status: %w", err)
-	}
-
-	fileObj := &openai.FileObject{
-		ID:            item.ID,
-		Bytes:         fileSpec.Bytes,
-		CreatedAt:     fileSpec.CreatedAt,
-		ExpiresAt:     fileSpec.ExpiresAt,
-		Filename:      fileSpec.Filename,
-		Object:        "file",
-		Purpose:       fileSpec.Purpose,
-		Status:        fileStatus.Status,
-		StatusDetails: fileStatus.StatusDetails,
-	}
-
-	return fileObj, nil
-}
-
-// getFileItemFromDB retrieves and deserializes a file item by ID.
-// Returns the file item if found, or writes an error response and returns nil.
-// Also validates tenant isolation if a tenant ID is present in the request header.
-func (c *FileApiHandler) getFileItemFromDB(w http.ResponseWriter, r *http.Request, operation string) (*dbapi.BatchItem, *openai.APIError) {
-
+// getFileItemFromDB retrieves a file item by ID.
+// Returns the file item if found, or an API error.
+func (c *FileAPIHandler) getFileItemFromDB(r *http.Request, operation string) (*dbapi.FileItem, *openai.APIError) {
 	ctx := r.Context()
 	logger := logging.FromRequest(r)
 
-	fileID := r.PathValue(pathParamFileID)
+	fileID := r.PathValue(common.PathParamFileID)
 	if fileID == "" {
 		apiErr := openai.NewAPIError(
 			http.StatusBadRequest,
@@ -150,13 +113,14 @@ func (c *FileApiHandler) getFileItemFromDB(w http.ResponseWriter, r *http.Reques
 	// Get tenant ID from context
 	tenantID := common.GetTenantIDFromContext(ctx)
 
-	// TODO: query with tenant id
 	// Retrieve file metadata from database
-	query := &dbapi.BatchDBQuery{
-		IDs:      []string{fileID},
-		TenantID: tenantID,
+	query := &dbapi.FileQuery{
+		BaseQuery: dbapi.BaseQuery{
+			IDs:      []string{fileID},
+			TenantID: tenantID,
+		},
 	}
-	items, _, _, err := c.dbClient.DBGet(ctx, query, true, 0, 1)
+	items, _, _, err := c.clients.FileDB.DBGet(ctx, query, true, 0, 1)
 	if err != nil {
 		logger.Error(err, "failed to retrieve file metadata")
 		apiErr := openai.NewAPIError(http.StatusInternalServerError, "", "Internal Server Error", nil)
@@ -182,7 +146,7 @@ func (c *FileApiHandler) getFileItemFromDB(w http.ResponseWriter, r *http.Reques
 		apiErr := openai.NewAPIError(
 			http.StatusNotFound,
 			"",
-			fmt.Sprintf("File with ID %s not found", item.ID),
+			fmt.Sprintf("File with ID %s not found", fileID),
 			nil,
 		)
 		return nil, &apiErr
@@ -191,7 +155,7 @@ func (c *FileApiHandler) getFileItemFromDB(w http.ResponseWriter, r *http.Reques
 	return item, nil
 }
 
-func (c *FileApiHandler) CreateFile(w http.ResponseWriter, r *http.Request) {
+func (c *FileAPIHandler) CreateFile(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	logger := logging.FromRequest(r)
 
@@ -199,7 +163,7 @@ func (c *FileApiHandler) CreateFile(w http.ResponseWriter, r *http.Request) {
 	// The file can contain up to 50,000 requests, and can be up to 200 MB in size.
 
 	// Check Content-Length header before reading the body
-	maxFileSize := c.config.GetMaxFileSizeBytes()
+	maxFileSize := c.config.FileAPI.GetMaxSizeBytes()
 	if r.ContentLength > maxFileSize {
 		logger.V(logging.DEBUG).Info("file size exceeds limit",
 			"contentLength", r.ContentLength, "limit", maxFileSize)
@@ -294,17 +258,31 @@ func (c *FileApiHandler) CreateFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if expiresAfterSeconds < openai.MinExpirationSeconds || expiresAfterSeconds > openai.MaxExpirationSeconds {
+			logger.V(logging.DEBUG).Info("expires_after seconds out of range", "seconds", expiresAfterSeconds)
+			apiErr := openai.NewAPIError(
+				http.StatusBadRequest,
+				"",
+				fmt.Sprintf("expires_after[seconds] must be between %d (1 hour) and %d (30 days)", openai.MinExpirationSeconds, openai.MaxExpirationSeconds),
+				nil,
+			)
+			common.WriteAPIError(w, r, apiErr)
+			return
+		}
+
 		expiresAt = createdAt + expiresAfterSeconds
 
 		logger.V(logging.DEBUG).Info("file expiration set from request", "anchor", expiresAfterAnchor, "seconds", expiresAfterSeconds, "expiresAt", expiresAt)
 	} else {
 		// Use default expire seconds from config if expires_after not provided
-		expiresAfterSeconds := c.config.GetFileDefaultExpirationSeconds()
+		expiresAfterSeconds := c.config.FileAPI.GetDefaultExpirationSeconds()
 		expiresAt = createdAt + expiresAfterSeconds
 		logger.V(logging.DEBUG).Info("file expiration set from config default", "seconds", expiresAfterSeconds, "expiresAt", expiresAt)
 	}
 
-	fileID := fmt.Sprintf("file_%s", uuid.NewString())
+	fileID := ucom.NewFileID()
+
+	trace.SpanFromContext(ctx).SetAttributes(attribute.String(uotel.AttrInputFileID, fileID))
 
 	// Sanitize filename
 	fileName := filepath.Base(fileHeader.Filename)
@@ -314,8 +292,13 @@ func (c *FileApiHandler) CreateFile(w http.ResponseWriter, r *http.Request) {
 
 	// Get tenant ID from context to use as folder name
 	tenantID := common.GetTenantIDFromContext(ctx)
-	folderName := tenantID
-	fileMeta, err := c.filesClient.Store(ctx, fileName, folderName, c.config.GetMaxFileSizeBytes(), c.config.GetMaxFileLineCount(), fileReader)
+	folderName, err := ucom.GetFolderNameByTenantID(tenantID)
+	if err != nil {
+		logger.Error(err, "failed to get folder name from tenant ID", "tenantID", tenantID)
+		common.WriteInternalServerError(w, r)
+		return
+	}
+	fileMeta, err := c.clients.File.Store(ctx, fileName, folderName, c.config.FileAPI.GetMaxSizeBytes(), c.config.FileAPI.GetMaxLineCount(), fileReader)
 	if err != nil {
 		logger.Error(err, "failed to store file content")
 		common.WriteInternalServerError(w, r)
@@ -327,56 +310,32 @@ func (c *FileApiHandler) CreateFile(w http.ResponseWriter, r *http.Request) {
 	var success bool
 	defer func() {
 		if !success {
-			if err := c.filesClient.Delete(ctx, fileName, folderName); err != nil {
+			if err := c.clients.File.Delete(ctx, fileName, folderName); err != nil {
 				logger.Error(err, "failed to cleanup file", "fileName", fileName, "folderName", folderName)
 			}
 		}
 	}()
 
-	// Construct file spec
-	fileSpec := FileSpec{
-		Bytes:       fileMeta.Size,
-		CreatedAt:   createdAt,
-		ExpiresAt:   expiresAt,
-		FolderName:  folderName,
-		Filename:    fileName,
-		Purpose:     purpose,
-		LinesNumber: fileMeta.LinesNumber,
-		ModTime:     fileMeta.ModTime.Unix(),
-	}
-	fileSpecData, err := json.Marshal(fileSpec)
-	if err != nil {
-		logger.Error(err, "failed to serialize file spec", "file_id", fileID)
-		common.WriteInternalServerError(w, r)
-		return
-	}
-
-	// Construct file status
-	fileStatus := FileStatusInfo{
-		Status:        openai.FileObjectStatusUploaded,
-		StatusDetails: "",
-	}
-	fileStatusData, err := json.Marshal(fileStatus)
-	if err != nil {
-		logger.Error(err, "failed to serialize file status", "file_id", fileID)
-		common.WriteInternalServerError(w, r)
-		return
+	// Construct the FileObject domain object
+	fileObj := openai.FileObject{
+		ID:        fileID,
+		Bytes:     fileMeta.Size,
+		CreatedAt: createdAt,
+		ExpiresAt: expiresAt,
+		Filename:  fileName,
+		Object:    "file",
+		Purpose:   purpose,
+		Status:    openai.FileObjectStatusUploaded,
 	}
 
 	// Save file metadata to database
-	tags := map[string]string{
-		dbapi.TagKeyPurpose: string(purpose),
-	}
-	dbItem := &dbapi.BatchItem{
-		ID:       fileID,
-		TenantID: tenantID,
-		Expiry:   expiresAt,
-		Tags:     tags,
-		Spec:     fileSpecData,
-		Status:   fileStatusData,
-	}
-	_, err = c.dbClient.DBStore(ctx, dbItem)
+	dbItem, err := converter.FileToDBItem(&fileObj, tenantID, dbapi.Tags{})
 	if err != nil {
+		logger.Error(err, "failed to convert file to database item", "file_id", fileID)
+		common.WriteInternalServerError(w, r)
+		return
+	}
+	if err := c.clients.FileDB.DBStore(ctx, dbItem); err != nil {
 		logger.Error(err, "failed to store file metadata", "file_id", fileID)
 		common.WriteInternalServerError(w, r)
 		return
@@ -386,19 +345,18 @@ func (c *FileApiHandler) CreateFile(w http.ResponseWriter, r *http.Request) {
 	// Mark as successful to prevent cleanup
 	success = true
 
-	fileObj, err := c.dbItemToFileObject(dbItem)
-	common.WriteJSONResponse(w, r, http.StatusOK, fileObj)
+	common.WriteJSONResponse(w, r, http.StatusOK, &fileObj)
 }
 
-func (c *FileApiHandler) ListFiles(w http.ResponseWriter, r *http.Request) {
+func (c *FileAPIHandler) ListFiles(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	logger := logging.FromRequest(r)
 
 	// Parse query parameters
-	after := r.URL.Query().Get("after")
-	limitStr := r.URL.Query().Get("limit")
-	order := r.URL.Query().Get("order")
-	purposeStr := r.URL.Query().Get("purpose")
+	after := r.URL.Query().Get(common.QueryParamAfter)
+	limitStr := r.URL.Query().Get(common.QueryParamLimit)
+	order := r.URL.Query().Get(common.QueryParamOrder)
+	purposeStr := r.URL.Query().Get(common.QueryParamPurpose)
 
 	// Validate and parse start
 	// TODO : OpenAI's after is a cursor for use in pagination. after is an object ID that defines your place in the list. For instance, if you make a list request and receive 100 objects, ending with obj_foo, your subsequent call can include after=obj_foo in order to fetch the next page of the list.
@@ -421,7 +379,7 @@ func (c *FileApiHandler) ListFiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate and parse limit (default: 10000, range: 1-10000)
-	limit := 10000
+	limit := defaultListFilesLimit
 	if limitStr != "" {
 		parsedLimit, err := strconv.Atoi(limitStr)
 		if err != nil {
@@ -435,12 +393,12 @@ func (c *FileApiHandler) ListFiles(w http.ResponseWriter, r *http.Request) {
 			common.WriteAPIError(w, r, apiErr)
 			return
 		}
-		if parsedLimit < 1 || parsedLimit > 10000 {
+		if parsedLimit < 1 || parsedLimit > maxListFilesLimit {
 			logger.V(logging.DEBUG).Info("limit out of range", "limit", parsedLimit)
 			apiErr := openai.NewAPIError(
 				http.StatusBadRequest,
 				"",
-				"Invalid limit parameter: must be between 1 and 10000",
+				fmt.Sprintf("Invalid limit parameter: must be between 1 and %d", maxListFilesLimit),
 				nil,
 			)
 			common.WriteAPIError(w, r, apiErr)
@@ -465,9 +423,8 @@ func (c *FileApiHandler) ListFiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate purpose if provided
-	var purpose openai.FileObjectPurpose
 	if purposeStr != "" {
-		purpose = openai.FileObjectPurpose(purposeStr)
+		purpose := openai.FileObjectPurpose(purposeStr)
 		if !purpose.IsValid() {
 			logger.V(logging.DEBUG).Info("invalid purpose parameter", "purpose", purposeStr)
 			apiErr := openai.NewAPIError(
@@ -484,39 +441,36 @@ func (c *FileApiHandler) ListFiles(w http.ResponseWriter, r *http.Request) {
 	logger.V(logging.DEBUG).Info("list files request", "after", after, "limit", limit, "order", order, "purpose", purposeStr)
 
 	// Query files from database with pagination
-	tagSelectors := map[string]string{}
-	if purposeStr != "" {
-		tagSelectors[dbapi.TagKeyPurpose] = purposeStr
-	}
-
-	// Get tenant ID from context
 	tenantID := common.GetTenantIDFromContext(ctx)
-
-	// TODO: query with tenantID
-	query := &dbapi.BatchDBQuery{
-		IDs:          nil,
-		TenantID:     tenantID,
-		TagSelectors: tagSelectors,
+	query := &dbapi.FileQuery{
+		BaseQuery: dbapi.BaseQuery{
+			TenantID:     tenantID,
+			TagSelectors: nil,
+		},
 	}
-	items, _, hasMore, err := c.dbClient.DBGet(ctx, query, true, start, limit)
+	if purposeStr != "" {
+		query.Purpose = purposeStr
+	}
+	items, _, expectMore, err := c.clients.FileDB.DBGet(ctx, query, true, start, limit)
 	if err != nil {
 		logger.Error(err, "failed to list files")
 		common.WriteInternalServerError(w, r)
 		return
 	}
 
-	// Convert BatchItem to FileObject
+	// Extract FileObjects from items
 	fileObjects := make([]openai.FileObject, 0, len(items))
 	for _, item := range items {
-		fileObj, err := c.dbItemToFileObject(item)
+		fileObj, err := converter.DBItemToFile(item)
 		if err != nil {
-			logger.Error(err, "failed to unmarshal file metadata")
-			continue
+			logger.Error(err, "failed to convert database item to file")
+			common.WriteInternalServerError(w, r)
+			return
 		}
 		fileObjects = append(fileObjects, *fileObj)
 	}
 
-	// TODO: can DBGet support sorting directly?
+	// TODO: can Get support sorting directly?
 	// Handle order parameter (reverse for desc since DB returns asc by default)
 	if order == "desc" {
 		// Reverse the slice
@@ -539,25 +493,24 @@ func (c *FileApiHandler) ListFiles(w http.ResponseWriter, r *http.Request) {
 		Data:    fileObjects,
 		FirstID: firstID,
 		LastID:  lastID,
-		HasMore: hasMore,
+		HasMore: expectMore,
 	}
 
 	common.WriteJSONResponse(w, r, http.StatusOK, response)
 }
 
-func (c *FileApiHandler) RetrieveFile(w http.ResponseWriter, r *http.Request) {
+func (c *FileAPIHandler) RetrieveFile(w http.ResponseWriter, r *http.Request) {
 	logger := logging.FromRequest(r)
 
-	item, apiErr := c.getFileItemFromDB(w, r, "retrieve")
+	item, apiErr := c.getFileItemFromDB(r, "retrieve")
 	if apiErr != nil {
 		common.WriteAPIError(w, r, *apiErr)
 		return
 	}
 
-	// Convert file object from item
-	fileObj, err := c.dbItemToFileObject(item)
+	fileObj, err := converter.DBItemToFile(item)
 	if err != nil {
-		logger.Error(err, "failed to construct file object")
+		logger.Error(err, "failed to convert database item to file")
 		common.WriteInternalServerError(w, r)
 		return
 	}
@@ -565,27 +518,33 @@ func (c *FileApiHandler) RetrieveFile(w http.ResponseWriter, r *http.Request) {
 	common.WriteJSONResponse(w, r, http.StatusOK, fileObj)
 }
 
-func (c *FileApiHandler) DownloadFile(w http.ResponseWriter, r *http.Request) {
+func (c *FileAPIHandler) DownloadFile(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	logger := logging.FromRequest(r)
 
-	item, apiErr := c.getFileItemFromDB(w, r, "download")
+	item, apiErr := c.getFileItemFromDB(r, "download")
 	if apiErr != nil {
 		common.WriteAPIError(w, r, *apiErr)
 		return
 	}
 
-	fileSpec := &FileSpec{}
-	if err := json.Unmarshal(item.Spec, fileSpec); err != nil {
-		logger.Error(err, "failed to unmarshal file spec")
+	fileObj, err := converter.DBItemToFile(item)
+	if err != nil {
+		logger.Error(err, "failed to convert database item to file")
+		common.WriteInternalServerError(w, r)
+		return
+	}
+	folderName, err := ucom.GetFolderNameByTenantID(item.TenantID)
+	if err != nil {
+		logger.Error(err, "failed to get folder name from tenant ID", "tenantID", item.TenantID)
 		common.WriteInternalServerError(w, r)
 		return
 	}
 
 	// Retrieve file content from storage
-	fileReader, fileMeta, err := c.filesClient.Retrieve(ctx, fileSpec.Filename, fileSpec.FolderName)
+	fileReader, fileMeta, err := c.clients.File.Retrieve(ctx, fileObj.Filename, folderName)
 	if err != nil {
-		logger.Error(err, "failed to retrieve file content", "fileName", fileSpec.Filename, "folderName", fileSpec.FolderName)
+		logger.Error(err, "failed to retrieve file content", "fileName", fileObj.Filename, "folderName", folderName)
 		common.WriteInternalServerError(w, r)
 		return
 	}
@@ -593,7 +552,7 @@ func (c *FileApiHandler) DownloadFile(w http.ResponseWriter, r *http.Request) {
 
 	// Set response headers for file download
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fileSpec.Filename))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fileObj.Filename))
 	if fileMeta.Size > 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(fileMeta.Size, 10))
 	}
@@ -608,32 +567,38 @@ func (c *FileApiHandler) DownloadFile(w http.ResponseWriter, r *http.Request) {
 	logger.Info("file download completed", "bytes_written", written)
 }
 
-func (c *FileApiHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
+func (c *FileAPIHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	logger := logging.FromRequest(r)
 
-	item, apiErr := c.getFileItemFromDB(w, r, "delete")
+	item, apiErr := c.getFileItemFromDB(r, "delete")
 	if apiErr != nil {
 		common.WriteAPIError(w, r, *apiErr)
 		return
 	}
 
-	fileSpec := &FileSpec{}
-	if err := json.Unmarshal(item.Spec, fileSpec); err != nil {
-		logger.Error(err, "failed to unmarshal file spec")
+	fileObj, err := converter.DBItemToFile(item)
+	if err != nil {
+		logger.Error(err, "failed to convert database item to file")
+		common.WriteInternalServerError(w, r)
+		return
+	}
+	folderName, err := ucom.GetFolderNameByTenantID(item.TenantID)
+	if err != nil {
+		logger.Error(err, "failed to get folder name from tenant ID", "tenantID", item.TenantID)
 		common.WriteInternalServerError(w, r)
 		return
 	}
 
 	// Delete physical file from storage
-	err := c.filesClient.Delete(ctx, fileSpec.Filename, fileSpec.FolderName)
+	err = c.clients.File.Delete(ctx, fileObj.Filename, folderName)
 	if err != nil {
-		logger.Error(err, "failed to delete physical file", "fileName", fileSpec.Filename, "folderName", fileSpec.FolderName)
+		logger.Error(err, "failed to delete physical file", "fileName", fileObj.Filename, "folderName", folderName)
 		// Continue to delete metadata even if physical file deletion fails
 	}
 
 	// Delete file metadata from database
-	deletedIDs, err := c.dbClient.DBDelete(ctx, []string{item.ID})
+	deletedIDs, err := c.clients.FileDB.DBDelete(ctx, []string{fileObj.ID})
 	if err != nil {
 		logger.Error(err, "failed to delete file metadata")
 		common.WriteInternalServerError(w, r)
@@ -644,7 +609,7 @@ func (c *FileApiHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 
 	// Construct delete response
 	deleteResp := openai.FileDeleteResponse{
-		ID:      item.ID,
+		ID:      fileObj.ID,
 		Object:  "file",
 		Deleted: true,
 	}

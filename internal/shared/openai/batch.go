@@ -19,6 +19,7 @@ package openai
 
 import (
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -277,12 +278,12 @@ func (r *CreateBatchRequest) Validate() error {
 	}
 
 	if r.OutputExpiresAfter != nil {
-		if r.OutputExpiresAfter.Anchor == "" {
-			return errors.New("output_expires_after.anchor is required")
+		if r.OutputExpiresAfter.Anchor != "created_at" {
+			return errors.New("output_expires_after.anchor must be 'created_at'")
 		}
 
-		if r.OutputExpiresAfter.Seconds < 3600 || r.OutputExpiresAfter.Seconds > 2592000 {
-			return errors.New("output_expires_after.seconds must be between 3600 (1 hour) and 2592000 (30 days)")
+		if r.OutputExpiresAfter.Seconds < MinExpirationSeconds || r.OutputExpiresAfter.Seconds > MaxExpirationSeconds {
+			return fmt.Errorf("output_expires_after.seconds must be between %d (1 hour) and %d (30 days)", MinExpirationSeconds, MaxExpirationSeconds)
 		}
 	}
 

@@ -25,14 +25,36 @@ import (
 
 // labels definition
 const (
-	// result labels
-	ResultSuccess = "success"
-	ResultFailed  = "failed"
+	// -- Result --
+	// ResultSuccess: Job reached a terminal state treated as success by policy (completed; cancelled is treated as success because it is user-initiated).
+	// ResultFailed: Job is failed and updated to failed status in the db
+	// ResultSkipped: Job was not processed by this worker (e.g. already terminal, not runnable, data inconsistency)
+	// ResultReEnqueued: Job was re-enqueued for retry due to transient backend/system issues
+	// ResultExpired: Job exceeded SLO deadline (either at dequeue time or mid-execution)
 
-	// reason lables
-	ReasonUnknown     = "unknown"
-	ReasonUserError   = "user_error"   // method, request validation failed.. etc.,
-	ReasonSystemError = "system_error" // SLO failed, system error.. etc.,
+	// Result labels
+	ResultSuccess    = "success"
+	ResultFailed     = "failed"
+	ResultSkipped    = "skipped"
+	ResultReEnqueued = "re_enqueued"
+	ResultExpired    = "expired" // job exceeded SLO deadline (dequeue-time or mid-execution)
+
+	// -- Reason --
+	// - If expired at dequeue time, use ReasonExpiredDequeue
+	// - If expired mid-execution, use ReasonExpiredExecution
+	// - If data inconsistency, use ReasonDBInconsistency
+	// - If retryable backend error, use ReasonDBTransient
+	// - If not runnable, use ReasonNotRunnableState
+	// - Otherwise, fall back to ReasonSystemError
+
+	// Reason labels
+	ReasonSystemError      = "system_error"       // unexpected internal errors (panic, serialization failure, invariant violation)
+	ReasonDBTransient      = "db_transient"       // temporary backend/storage error; safe to retry
+	ReasonDBInconsistency  = "db_inconsistency"   // PQ item exists but DB item missing or corrupted
+	ReasonNotRunnableState = "not_runnable_state" // job status is not runnable by processor policy
+	ReasonExpiredDequeue   = "expired_dequeue"    // SLO already exceeded before execution started; skipped at dequeue
+	ReasonExpiredExecution = "expired_execution"  // SLO deadline fired during execution; partial results preserved
+	ReasonNone             = "none"               // no additional reason beyond the result (e.g. success, cancelled)
 
 	// size bucket labels
 	Bucket100   = "100"   // less than 100 lines
@@ -58,16 +80,30 @@ func GetSizeBucket(totalLines int) string {
 }
 
 var (
-	jobsProcessed         *prometheus.CounterVec
-	jobProcessingDuration *prometheus.HistogramVec
-	jobQueueWaitDuration  *prometheus.HistogramVec
-	totalWorkers          prometheus.Gauge
-	activeWorkers         prometheus.Gauge
-	jobErrorsModelTotal   *prometheus.CounterVec
+	jobsProcessed                 *prometheus.CounterVec
+	jobProcessingDuration         *prometheus.HistogramVec
+	jobQueueWaitDuration          *prometheus.HistogramVec
+	totalWorkers                  prometheus.Gauge
+	activeWorkers                 prometheus.Gauge
+	requestErrorsModelTotal       *prometheus.CounterVec
+	processorInflightRequests     prometheus.Gauge
+	processorMaxInflightConc      prometheus.Gauge
+	planBuildDuration             *prometheus.HistogramVec
+	modelInflightRequests         *prometheus.GaugeVec
+	modelRequestExecutionDuration *prometheus.HistogramVec
+	fileUploadRetriesTotal        *prometheus.CounterVec
+)
+
+// FileType labels for file upload metrics.
+type FileType string
+
+const (
+	FileTypeOutput FileType = "output"
+	FileTypeError  FileType = "error"
 )
 
 func InitMetrics(cfg config.ProcessorConfig) error {
-	// number of jobs processed : TODO:: add tenantID?
+	// number of jobs processed
 	jobsProcessed = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "jobs_processed_total",
@@ -94,15 +130,67 @@ func InitMetrics(cfg config.ProcessorConfig) error {
 	)
 
 	// errors by model
-	jobErrorsModelTotal = prometheus.NewCounterVec(
+	requestErrorsModelTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "job_errors_by_model_total",
-			Help: "Total number of job processing errors by model",
+			Name: "request_errors_by_model_total",
+			Help: "Total number of request errors by model",
 		},
 		[]string{"model"},
 	)
 
-	// job processing duratino
+	// global in-flight request count during execution
+	processorInflightRequests = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "processor_inflight_requests",
+			Help: "Current number of in-flight inference requests for the processor",
+		},
+	)
+
+	// configured GlobalConcurrency value for utilization calculation
+	processorMaxInflightConc = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "processor_max_inflight_concurrency",
+			Help: "Configured maximum number of concurrent in-flight inference requests (GlobalConcurrency)",
+		},
+	)
+	processorMaxInflightConc.Set(float64(cfg.GlobalConcurrency))
+
+	// ingestion plan build duration
+	planBuildDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name: "plan_build_duration_seconds",
+			Help: "Duration of ingestion and plan build in seconds",
+			Buckets: prometheus.ExponentialBuckets(
+				cfg.ProcessTimeBucket.BucketStart,
+				cfg.ProcessTimeBucket.BucketFactor,
+				cfg.ProcessTimeBucket.BucketCount,
+			),
+		}, []string{"tenantID", "size_bucket"},
+	)
+
+	// per-model in-flight requests during execution
+	modelInflightRequests = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "model_inflight_requests",
+			Help: "Current number of in-flight inference requests per model",
+		},
+		[]string{"model"},
+	)
+
+	// per-request execution duration by model
+	modelRequestExecutionDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name: "model_request_execution_duration_seconds",
+			Help: "Per-request execution duration in seconds by model",
+			Buckets: prometheus.ExponentialBuckets(
+				cfg.ProcessTimeBucket.BucketStart,
+				cfg.ProcessTimeBucket.BucketFactor,
+				cfg.ProcessTimeBucket.BucketCount,
+			),
+		}, []string{"model"},
+	)
+
+	// job processing duration
 	jobProcessingDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name: "job_processing_duration_seconds",
@@ -118,7 +206,7 @@ func InitMetrics(cfg config.ProcessorConfig) error {
 	// duration of queue wait time
 	jobQueueWaitDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name: "job_queue_wait_duration",
+			Name: "job_queue_wait_duration_seconds",
 			Help: "Time spent in the priority queue before being picked up",
 			Buckets: prometheus.ExponentialBuckets(
 				cfg.QueueTimeBucket.BucketStart,
@@ -128,6 +216,15 @@ func InitMetrics(cfg config.ProcessorConfig) error {
 		}, []string{"tenantID"},
 	)
 
+	// upload retries by file type (output / error)
+	fileUploadRetriesTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "file_upload_retries_total",
+			Help: "Total number of file upload retry attempts by file type",
+		},
+		[]string{"file_type"},
+	)
+
 	// metrics to register
 	metricsToRegister := []prometheus.Collector{
 		jobProcessingDuration,
@@ -135,7 +232,13 @@ func InitMetrics(cfg config.ProcessorConfig) error {
 		totalWorkers,
 		activeWorkers,
 		jobsProcessed,
-		jobErrorsModelTotal,
+		requestErrorsModelTotal,
+		processorInflightRequests,
+		processorMaxInflightConc,
+		planBuildDuration,
+		modelInflightRequests,
+		modelRequestExecutionDuration,
+		fileUploadRetriesTotal,
 	}
 
 	for _, metric := range metricsToRegister {
@@ -177,7 +280,42 @@ func DecActiveWorkers() {
 	activeWorkers.Dec()
 }
 
-// RecordJobError increments the error count for a specific model.
-func RecordJobError(model string) {
-	jobErrorsModelTotal.WithLabelValues(model).Inc()
+// RecordRequestError increments the error count for a specific model.
+func RecordRequestError(model string) {
+	requestErrorsModelTotal.WithLabelValues(model).Inc()
+}
+
+// IncProcessorInflightRequests increments the processor global in-flight request gauge.
+func IncProcessorInflightRequests() {
+	processorInflightRequests.Inc()
+}
+
+// DecProcessorInflightRequests decrements the processor global in-flight request gauge.
+func DecProcessorInflightRequests() {
+	processorInflightRequests.Dec()
+}
+
+// RecordPlanBuildDuration observes ingestion plan build duration.
+func RecordPlanBuildDuration(duration time.Duration, tenantID string, sizeBucket string) {
+	planBuildDuration.WithLabelValues(tenantID, sizeBucket).Observe(duration.Seconds())
+}
+
+// IncModelInflightRequests increments the in-flight request gauge for a model.
+func IncModelInflightRequests(model string) {
+	modelInflightRequests.WithLabelValues(model).Inc()
+}
+
+// DecModelInflightRequests decrements the in-flight request gauge for a model.
+func DecModelInflightRequests(model string) {
+	modelInflightRequests.WithLabelValues(model).Dec()
+}
+
+// RecordModelRequestExecutionDuration observes per-request execution duration by model.
+func RecordModelRequestExecutionDuration(duration time.Duration, model string) {
+	modelRequestExecutionDuration.WithLabelValues(model).Observe(duration.Seconds())
+}
+
+// RecordFileUploadRetry increments the upload retry counter for a given file type.
+func RecordFileUploadRetry(fileType FileType) {
+	fileUploadRetriesTotal.WithLabelValues(string(fileType)).Inc()
 }

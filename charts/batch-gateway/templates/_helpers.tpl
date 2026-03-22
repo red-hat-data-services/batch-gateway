@@ -23,6 +23,52 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
+{{/* ========== File Storage Helpers ========== */}}
+
+{{/*
+Volume for shared file storage.
+- "fs": mounts a PersistentVolumeClaim; global.fileClient.fs.pvcName must be set.
+- "s3", "mock": no volume needed.
+*/}}
+{{- define "batch-gateway.filesStorage.volume" -}}
+{{- if eq .Values.global.fileClient.type "fs" }}
+{{- if not .Values.global.fileClient.fs.pvcName }}
+{{- fail "global.fileClient.fs.pvcName must be set when global.fileClient.type is \"fs\"" }}
+{{- end }}
+- name: files-storage
+  persistentVolumeClaim:
+    claimName: {{ .Values.global.fileClient.fs.pvcName }}
+{{- end }}
+{{- end }}
+
+{{/*
+VolumeMount for shared file storage. Only rendered when type is "fs".
+*/}}
+{{- define "batch-gateway.filesStorage.volumeMount" -}}
+{{- if eq .Values.global.fileClient.type "fs" }}
+- name: files-storage
+  mountPath: {{ .Values.global.fileClient.fs.basePath }}
+{{- end }}
+{{- end }}
+
+{{/* ========== TLS Validation Helper ========== */}}
+
+{{/*
+Validate TLS configuration for a component.
+Ensures exactly one TLS mode is active: secretName or certManager.
+Usage: {{ include "batch-gateway.validateTLS" (dict "tls" .Values.apiserver.tls "component" "apiserver") }}
+*/}}
+{{- define "batch-gateway.validateTLS" -}}
+{{- if .tls.enabled -}}
+  {{- if and .tls.secretName .tls.certManager.enabled -}}
+    {{- fail (printf "%s.tls: secretName and certManager are mutually exclusive — set only one" .component) -}}
+  {{- end -}}
+  {{- if not (or .tls.secretName .tls.certManager.enabled) -}}
+    {{- fail (printf "%s.tls: enabled but neither secretName nor certManager is configured" .component) -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{/* ========== API Server Helpers ========== */}}
 
 {{/*
@@ -33,7 +79,11 @@ API Server fullname
 {{- .Values.apiserver.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
 {{- $name := default .Chart.Name .Values.apiserver.nameOverride }}
+{{- if contains $name .Release.Name }}
+{{- printf "%s-apiserver" .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
 {{- printf "%s-%s-apiserver" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
 {{- end }}
 {{- end }}
 
@@ -85,7 +135,11 @@ Processor fullname
 {{- .Values.processor.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
 {{- $name := default .Chart.Name .Values.processor.nameOverride }}
+{{- if contains $name .Release.Name }}
+{{- printf "%s-processor" .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
 {{- printf "%s-%s-processor" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
 {{- end }}
 {{- end }}
 

@@ -23,6 +23,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.processor.terminationGracePeriodSeconds | default 60 }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -39,9 +40,16 @@ spec:
         args:
         - --config=/etc/config/config.yaml
         - --v={{ .Values.processor.logging.verbosity }}
+        {{- if .Values.global.otel.endpoint }}
+        env:
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: {{ .Values.global.otel.endpoint | quote }}
+        - name: OTEL_EXPORTER_OTLP_INSECURE
+          value: {{ .Values.global.otel.insecure | quote }}
+        {{- end }}
         ports:
         - name: metrics
-          containerPort: {{ .Values.processor.config.addr | trimPrefix ":" }}
+          containerPort: {{ (splitList ":" .Values.processor.config.addr | last) | int }}
           protocol: TCP
         livenessProbe:
           {{- toYaml .Values.processor.livenessProbe | nindent 12 }}
@@ -53,34 +61,36 @@ spec:
         - name: config
           mountPath: /etc/config
           readOnly: true
-        {{- if .Values.processor.tls.enabled }}
-        - name: tls
-          mountPath: /etc/tls
-          readOnly: true
-        {{- end }}
+        - name: workdir
+          mountPath: {{ .Values.processor.config.workDir }}
+        {{- include "batch-gateway.filesStorage.volumeMount" . | nindent 8 }}
         {{- with .Values.processor.volumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-        {{- if .Values.processor.database.existingSecret }}
-        env:
-        - name: DATABASE_URL
-          valueFrom:
-            secretKeyRef:
-              name: {{ .Values.processor.database.existingSecret }}
-              key: {{ .Values.processor.database.secretKey }}
+        {{- if .Values.global.appSecretName }}
+        - name: secrets
+          mountPath: /etc/.secrets
+          readOnly: true
         {{- end }}
       volumes:
       - name: config
         configMap:
           name: {{ include "batch-gateway.processor.fullname" . }}-config
-      {{- if .Values.processor.tls.enabled }}
-      - name: tls
-        secret:
-          {{- if .Values.processor.tls.secretName }}
-          secretName: {{ .Values.processor.tls.secretName }}
-          {{- else }}
-          secretName: {{ include "batch-gateway.processor.fullname" . }}-tls
+      - name: workdir
+        emptyDir:
+          {{- if .Values.processor.workDirVolume.medium }}
+          medium: {{ .Values.processor.workDirVolume.medium | quote }}
           {{- end }}
+          {{- if .Values.processor.workDirVolume.sizeLimit }}
+          sizeLimit: {{ .Values.processor.workDirVolume.sizeLimit | quote }}
+          {{- end }}
+      {{- include "batch-gateway.filesStorage.volume" . | nindent 6 }}
+      {{- if .Values.global.appSecretName }}
+      - name: secrets
+        projected:
+          sources:
+          - secret:
+              name: {{ .Values.global.appSecretName }}
       {{- end }}
       {{- with .Values.processor.volumes }}
       {{- toYaml . | nindent 6 }}

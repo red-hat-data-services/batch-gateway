@@ -28,11 +28,12 @@ import (
 	"time"
 
 	db_api "github.com/llm-d-incubation/batch-gateway/internal/database/api"
+	"github.com/llm-d-incubation/batch-gateway/internal/util/logging"
 	goredis "github.com/redis/go-redis/v9"
 	"k8s.io/klog/v2"
 )
 
-func (c *BatchDSClientRedis) PQEnqueue(ctx context.Context, item *db_api.BatchJobPriority) (err error) {
+func (c *ExchangeDBClientRedis) PQEnqueue(ctx context.Context, item *db_api.BatchJobPriority) (err error) {
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -61,23 +62,34 @@ func (c *BatchDSClientRedis) PQEnqueue(ctx context.Context, item *db_api.BatchJo
 	}
 	cctx, ccancel := context.WithTimeout(ctx, c.timeout)
 	defer ccancel()
-	res := c.redisClient.ZAddNX(cctx, priorityQueueKeyName, zitem)
-	if res == nil {
+	cmdRes, lerr := c.redisClient.Pipelined(cctx, func(pipe goredis.Pipeliner) error {
+		pipe.ZAddNX(cctx, priorityQueueKeyName, zitem)
+		if item.TTL > 0 {
+			pipe.Expire(cctx, priorityQueueKeyName, time.Duration(item.TTL)*time.Second)
+		}
+		return nil
+	})
+	if lerr != nil {
+		err = lerr
+		logger.Error(err, "PQEnqueue:")
+	}
+	if cmdRes == nil {
 		err = fmt.Errorf("redis command result is nil")
 		logger.Error(err, "PQEnqueue:")
 		return
 	}
-	if err = res.Err(); err != nil {
-		logger.Error(err, "PQEnqueue: redis ZAddNX failed")
-		return
+	for _, cmd := range cmdRes {
+		if err = cmd.Err(); err != nil {
+			logger.Error(err, "PQEnqueue: redis command failed", "cmd", cmd.Name())
+			return
+		}
 	}
 
 	logger.Info("PQEnqueue: succeeded")
-
 	return
 }
 
-func (c *BatchDSClientRedis) PQDelete(ctx context.Context, item *db_api.BatchJobPriority) (nDeleted int, err error) {
+func (c *ExchangeDBClientRedis) PQDelete(ctx context.Context, item *db_api.BatchJobPriority) (nDeleted int, err error) {
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -103,6 +115,10 @@ func (c *BatchDSClientRedis) PQDelete(ctx context.Context, item *db_api.BatchJob
 		logger.Error(err, "PQDelete:")
 		return
 	}
+	if res.Err() == goredis.Nil {
+		logger.Info("PQDelete: key not found")
+		return
+	}
 	if err = res.Err(); err != nil {
 		logger.Error(err, "PQDelete: redis ZRemRangeByScore failed")
 		return
@@ -110,11 +126,10 @@ func (c *BatchDSClientRedis) PQDelete(ctx context.Context, item *db_api.BatchJob
 	nDeleted = int(res.Val())
 
 	logger.Info("PQDelete: succeeded")
-
 	return
 }
 
-func (c *BatchDSClientRedis) PQDequeue(ctx context.Context, timeout time.Duration, maxItems int) (
+func (c *ExchangeDBClientRedis) PQDequeue(ctx context.Context, timeout time.Duration, maxItems int) (
 	jobPriorities []*db_api.BatchJobPriority, err error) {
 
 	if ctx == nil {
@@ -123,10 +138,14 @@ func (c *BatchDSClientRedis) PQDequeue(ctx context.Context, timeout time.Duratio
 	logger := klog.FromContext(ctx)
 
 	// Get items from the queue.
-	cctx, ccancel := context.WithTimeout(ctx, timeout+2*time.Second)
-	defer ccancel()
+	if timeout > 0 {
+		logger.V(logging.DEBUG).Info("PQDequeue: Start BZMPop")
+	} else {
+		logger.Info("PQDequeue: Start BZMPop without timeout")
+	}
 	_, vals, err := c.redisClient.BZMPop(
-		cctx, timeout, goredis.Min.String(), int64(maxItems), priorityQueueKeyName).Result()
+		ctx, timeout, goredis.Min.String(), int64(maxItems), priorityQueueKeyName).Result()
+	logger.V(logging.DEBUG).Info("PQDequeue: End BZMPop")
 	if err != nil {
 		if unrecognizedBlockingError(err) {
 			logger.Error(err, "PQDequeue: BZMPop failed")
@@ -162,7 +181,6 @@ func (c *BatchDSClientRedis) PQDequeue(ctx context.Context, timeout time.Duratio
 	}
 
 	logger.Info("PQDequeue: succeeded", "nItems", len(jobPriorities))
-
 	return
 }
 
