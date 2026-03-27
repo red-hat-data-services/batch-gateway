@@ -12,7 +12,7 @@ COPY go.sum go.sum
 RUN go mod download
 
 # Copy the go source
-COPY cmd/apiserver/ cmd/apiserver/
+COPY cmd/batch-gc/ cmd/batch-gc/
 COPY internal/ internal/
 COPY pkg/ pkg/
 
@@ -22,12 +22,12 @@ COPY pkg/ pkg/
 # the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 RUN mkdir -p bin && \
-    CGO_ENABLED=${CGO_ENABLED} GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -o bin/batch-gateway-apiserver ./cmd/apiserver
+    CGO_ENABLED=${CGO_ENABLED} GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -o bin/batch-gateway-gc ./cmd/batch-gc
 
 # TODO: switch base image to gcr.io/distroless/static:nonroot before release
 FROM registry.access.redhat.com/ubi9/ubi-micro:latest
 WORKDIR /
-COPY --from=builder /opt/app-root/src/bin/batch-gateway-apiserver /app/batch-gateway-apiserver
+COPY --from=builder /opt/app-root/src/bin/batch-gateway-gc /app/batch-gateway-gc
 USER 1001:1001
 
-ENTRYPOINT ["/app/batch-gateway-apiserver"]
+ENTRYPOINT ["/app/batch-gateway-gc"]
