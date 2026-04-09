@@ -27,7 +27,7 @@ This guide demonstrates how to deploy batch-gateway on vanilla Kubernetes (or Op
     - Authenticated request is forwarded to **batch-gateway apiserver**, which stores the batch job
 3. **Processor** dequeues the batch job and sends inference requests back through the same Istio Gateway (`istio-gateway`) with the user's original token
 4. The Gateway matches `/{ns}/{model}/v1/*` → **llm-route** (HTTPRoute, manually created with URL rewrite rules)
-    - **AuthPolicy** on the llm-route performs authentication and authorization (SubjectAccessReview — checks if the original user can `get inferencepools/<pool-name>`) — if the user lacks permission, the request is rejected with 403
+    - **AuthPolicy** on the llm-route performs authentication and authorization (SubjectAccessReview — checks if the original user can `get inferencepools/<model-name>`, where `<model-name>` is extracted from the URL path, not the backend InferencePool object name) — if the user lacks permission, the request is rejected with 403
     - **TokenRateLimitPolicy** on the llm-route enforces per-user token rate limiting, keyed by Kubernetes username from TokenReview
 5. Request is routed to **InferencePool** → **EPP** (endpoint picker) → **vLLM** model server, and the response is returned to the Processor, which adds the response to the batch job's output file
 
@@ -46,7 +46,11 @@ HTTPRoute authentication behavior:
 
 ### 1.4 Authorization Model
 
-Users need RBAC `get` permission on the `inferencepools` resource whose name matches the **model name in the URL path** (not the InferencePool object name). This is because the AuthPolicy extracts the resource name from the URL via `request.path.split("/")[2]`. To grant access, create a Role and RoleBinding:
+Users need RBAC `get` permission on the `inferencepools` resource whose name matches the **model name in the URL path**. The AuthPolicy extracts the resource name from the URL via `request.path.split("/")[2]`.
+
+> **Important**: The SAR resource name (derived from the URL path segment) is **independent** of the HTTPRoute backend `InferencePool` metadata name. Which `InferencePool` a given path segment routes to is determined by **routing** (the HTTPRoute / route map), not by SAR. SAR controls *who* can access a model endpoint; the HTTPRoute controls *where* that endpoint's traffic is sent. For example, a URL path segment `random` may route to an `InferencePool` named `gaie-llmd` — the RBAC `resourceNames` should use the URL path segment (`random`), not the `InferencePool` object name.
+
+To grant access, create a Role and RoleBinding:
 
 > **Note**: Unlike RHOAI (which checks `llminferenceservices`), the k8s deployment checks `inferencepools` because the llm-route directly references InferencePool backends.
 
@@ -89,6 +93,15 @@ kubectl auth can-i get inferencepools/<model-name> -n <llm-namespace> --as=syste
 HTTPRoute authorization behavior:
 - **LLM route**: SubjectAccessReview checks if user can `get inferencepools/<model-name>` (extracted from URL path) — unauthorized requests are rejected with **403**
 - **Batch route**: No authorization check — authorization is enforced by the LLM route when the processor forwards inference requests with the user's original token
+
+### 1.5 Security boundary: batch-route vs llm-route
+
+For security and operations readers: **admission on the batch API is not the same as authorization for inference.**
+
+- **batch-route** proves the caller has a valid Kubernetes token and applies batch-side **RateLimitPolicy**. Invalid or missing credentials are rejected with **401**; excess batch API traffic is rejected with **429**. It does **not** evaluate whether the caller may use a specific model.
+- **llm-route** runs **authentication and authorization** (SubjectAccessReview on `inferencepools` as above) on each inference request the processor sends through the gateway. A user can create a batch job and still see **per-request failures** (often surfaced as failed lines or job errors) when the llm-route returns **403** — this is **by design**, not a bypass of model access control.
+
+Configure **`passThroughHeaders: {Authorization}`** so the processor forwards the end user’s bearer token on inference calls. Without that, the gateway cannot attribute inference traffic to the original caller and model-level checks cannot run as intended.
 
 ## 2. Prerequisites
 
@@ -545,7 +558,7 @@ spec:
 EOF
 ```
 
-> **Note**: The authorization uses `inferencepools` (not `llminferenceservices` as in RHOAI). The `request.path.split("/")[2]` extracts the model name from the URL path `/{namespace}/{model}/...` to match the InferencePool resource name.
+> **Note**: The authorization uses `inferencepools` (not `llminferenceservices` as in RHOAI). The `request.path.split("/")[2]` extracts the **model name** from the URL path `/{namespace}/{model}/...` for the SAR check. This is the user-facing model name, not the backend `InferencePool` object name — the HTTPRoute determines which `InferencePool` actually receives traffic for each path prefix (see [Section 1.4](#14-authorization-model)).
 
 </details>
 
@@ -608,10 +621,11 @@ helm install postgresql oci://registry-1.docker.io/bitnamicharts/postgresql \
 kubectl rollout status statefulset/postgresql -n ${BATCH_NS} --timeout=120s
 
 # Create application secret
+# Replace <your-password> with your actual PostgreSQL password
 kubectl create secret generic batch-gateway-secrets \
     --namespace ${BATCH_NS} \
     --from-literal=redis-url="redis://redis-master.${BATCH_NS}.svc.cluster.local:6379/0" \
-    --from-literal=postgresql-url="postgresql://postgres:postgres@postgresql.${BATCH_NS}.svc.cluster.local:5432/batch?sslmode=disable"
+    --from-literal=postgresql-url="postgresql://postgres:<your-password>@postgresql.${BATCH_NS}.svc.cluster.local:5432/batch?sslmode=disable"
 
 # Create PVC for batch file storage (alternatively, S3-compatible storage can be used — see Helm chart values for s3 configuration)
 kubectl apply -f - <<EOF
@@ -636,11 +650,24 @@ EOF
 <summary>Install batch-gateway</summary>
 
 ```bash
+IMAGE_TAG=v0.1.0
+APISERVER_REPO=quay.io/redhat-user-workloads/open-data-hub-tenant/temp-batch-gateway-apiserver
+PROCESSOR_REPO=quay.io/redhat-user-workloads/open-data-hub-tenant/temp-batch-gateway-processor
+GC_REPO=quay.io/redhat-user-workloads/open-data-hub-tenant/temp-batch-gateway-gc
+```
+
+```bash
 # Model gateway URL: route through the main istio-gateway (which has AuthPolicy)
 MODEL_GW_URL="https://${GATEWAY_NAME}-istio.${GATEWAY_NAMESPACE}.svc.cluster.local/${LLM_NS}/${MODEL_NAME}"
 
 helm install batch-gateway ./charts/batch-gateway \
     --namespace ${BATCH_NS} \
+    --set "apiserver.image.repository=${APISERVER_REPO}" \
+    --set "apiserver.image.tag=${IMAGE_TAG}" \
+    --set "processor.image.repository=${PROCESSOR_REPO}" \
+    --set "processor.image.tag=${IMAGE_TAG}" \
+    --set "gc.image.repository=${GC_REPO}" \
+    --set "gc.image.tag=${IMAGE_TAG}" \
     --set "global.secretName=batch-gateway-secrets" \
     --set "global.dbClient.type=postgresql" \
     --set "global.fileClient.type=fs" \
@@ -660,6 +687,7 @@ helm install batch-gateway ./charts/batch-gateway \
     --set "apiserver.tls.certManager.dnsNames={batch-gateway-apiserver,batch-gateway-apiserver.${BATCH_NS}.svc.cluster.local,localhost}"
 ```
 
+> - **Processor → inference TLS**: This demo uses `tlsInsecureSkipVerify=true` for a typical self-signed in-cluster gateway. For private CAs, mTLS, or mounting certificate Secrets, see [Processor inference TLS](processor-inference-tls.md).
 > - **`modelGateways.<model>.url`**: The processor uses this URL to send inference requests. It points to the Gateway's model endpoint (via in-cluster Service DNS), not directly to the model server, so that requests go through the Gateway's AuthPolicy and rate limiting.
 > - **`passThroughHeaders: {Authorization}`**: Ensures the processor sends inference requests on behalf of the original user, so the LLM route's AuthPolicy can enforce model-level authorization on batch requests.
 > - **`apiserver.tls.certManager.*`**: Enables TLS for the batch API server using cert-manager. The `dnsNames` should include the Service name and FQDN so the Gateway can verify the backend certificate when re-encrypting traffic (see DestinationRule in 3.8).

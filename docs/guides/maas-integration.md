@@ -170,9 +170,10 @@ $ helm install postgresql bitnami/postgresql -n batch-api \
 
 ```bash
 # App secret with database connection URLs
+# Replace <your-password> with your actual PostgreSQL password
 $ kubectl create secret generic batch-gateway-secrets -n batch-api \
     --from-literal=redis-url=redis://redis-master.batch-api.svc.cluster.local:6379/0 \
-    --from-literal=postgresql-url=postgresql://postgres:postgres@postgresql.batch-api.svc.cluster.local:5432/postgres
+    --from-literal=postgresql-url=postgresql://postgres:<your-password>@postgresql.batch-api.svc.cluster.local:5432/postgres
 
 # PVC for file storage
 $ kubectl apply -f - <<EOF
@@ -277,7 +278,11 @@ EOF
 
 ## 5. Create Policies
 
-### 5.1 Batch AuthPolicy
+### 5.1 Security boundary: batch-route vs LLM (model) route
+
+**Admission on the batch HTTPRoute is not authorization for model inference.** The batch-route policies below validate the MaaS API key and rate-limit batch API usage (**401** / **429** as configured). The auto-generated **llm-route** policies (from MaaSModelRef / MaaSAuthPolicy) perform **model access** checks; a valid batch submission can still yield inference **403** or failed batch lines when the user lacks group access — by design. Use **`passThroughHeaders`** on batch-gateway so the processor forwards **`Authorization`** (and **`X-MaaS-Subscription`** if required) on processor-initiated inference calls; otherwise the gateway cannot enforce the same boundary as for direct model clients.
+
+### 5.2 Batch AuthPolicy
 
 The MaaS gateway has a default-deny AuthPolicy. Create a per-route AuthPolicy for the batch-route that validates MaaS API keys via the same HTTP callback that MaaS uses for model routes:
 
@@ -355,7 +360,7 @@ EOF
 
 This AuthPolicy validates API keys by calling the MaaS API's `/internal/v1/api-keys/validate` endpoint — the same mechanism MaaS uses for model inference routes. Authorino sends the API key to maas-api, which checks the hash against PostgreSQL and returns `{valid, username, groups, keyId}`.
 
-### 5.2 Batch RateLimitPolicy
+### 5.3 Batch RateLimitPolicy
 
 Request-count-based rate limiting on the batch-route, keyed per user:
 
@@ -381,7 +386,7 @@ spec:
 EOF
 ```
 
-### 5.3 MaaS Model Policies
+### 5.4 MaaS Model Policies
 
 Register the model in MaaS and configure token-based rate limiting on the model inference route. The MaaS controller automatically generates a Kuadrant `AuthPolicy` (API key validation + group membership) and `TokenRateLimitPolicy` from these CRs.
 

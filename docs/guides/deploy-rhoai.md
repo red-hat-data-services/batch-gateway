@@ -92,8 +92,18 @@ HTTPRoute authorization behavior:
 - **LLM route**: SubjectAccessReview checks if user can `get llminferenceservices/<name>` — unauthorized requests are rejected with **403**
 - **Batch route**: No authorization check — authorization is enforced by the LLM route when the processor forwards inference requests with the user's original token
 
+### 1.5 Security boundary: batch-route vs llm-route
+
+For security and operations readers: **admission on the batch API is not the same as authorization for inference.**
+
+- **batch-route** proves the caller has a valid Kubernetes token and applies batch-side **RateLimitPolicy**. Invalid or missing credentials are rejected with **401**; excess batch API traffic is rejected with **429**. It does **not** evaluate whether the caller may use a specific `LLMInferenceService`.
+- **llm-route** runs **authentication and authorization** (SubjectAccessReview on `llminferenceservices` as above) on each inference request the processor sends through the gateway. A user can create a batch job and still see **per-request failures** (often surfaced as failed lines or job errors) when the llm-route returns **403** — this is **by design**, not a bypass of model access control.
+
+Configure **`passThroughHeaders: {Authorization}`** so the processor forwards the end user’s bearer token on inference calls. Without that, the gateway cannot attribute inference traffic to the original caller and model-level checks cannot run as intended.
+
 ## 2. Prerequisites
-- OpenShift cluster 4.19.9 or later.
+- OpenShift cluster 4.20 or later (required for Distributed Inference with llm-d).
+- Red Hat OpenShift AI 3.4 or later.
 - OpenShift Service Mesh v2 is not installed in the cluster.
 
 
@@ -386,7 +396,7 @@ oc wait --for=condition=ready pod -l authorino-resource=authorino \
 
 ### 3.5 Install RHOAI
 
-Follow [RHOAI Installation Guide](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.3/html/installing_and_uninstalling_openshift_ai_self-managed/index) to install RHOAI
+Follow [RHOAI Installation Guide](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/installing_and_uninstalling_openshift_ai_self-managed/index) to install RHOAI
 
 <details>
 <summary>Install RHOAI operator</summary>
@@ -471,9 +481,9 @@ oc wait datasciencecluster/default-dsc --for=jsonpath='{.status.phase}'=Ready --
 
 ### 3.6 Deploy model with llm-d
 
-Follow [deploy model doc](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.3/html/deploying_models/deploying_models#deploying-models-using-distributed-inference_rhoai-user) to deploy model with LLM-D
+Follow [deploy model doc](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/deploying_models/deploying_models#deploying-models-using-distributed-inference_rhoai-user) to deploy model with LLM-D
 
-For more examples: [kserve samples repo](https://github.com/red-hat-data-services/kserve/tree/rhoai-3.3/docs/samples/llmisvc)
+For more examples: [kserve samples repo](https://github.com/red-hat-data-services/kserve/tree/rhoai-3.4/docs/samples/llmisvc)
 
 The following example deploys a simulated model with `LLMInferenceService`.
 
@@ -647,10 +657,11 @@ helm install postgresql oci://registry-1.docker.io/bitnamicharts/postgresql \
 oc rollout status statefulset/postgresql -n ${BATCH_NS} --timeout=120s
 
 # Create application secret
+# Replace <your-password> with your actual PostgreSQL password
 kubectl create secret generic batch-gateway-secrets \
     --namespace ${BATCH_NS} \
     --from-literal=redis-url="redis://redis-master.${BATCH_NS}.svc.cluster.local:6379/0" \
-    --from-literal=postgresql-url="postgresql://postgres:postgres@postgresql.${BATCH_NS}.svc.cluster.local:5432/batch?sslmode=disable"
+    --from-literal=postgresql-url="postgresql://postgres:<your-password>@postgresql.${BATCH_NS}.svc.cluster.local:5432/batch?sslmode=disable"
 
 # Create PVC for batch file storage (alternatively, S3-compatible storage can be used — see Helm chart values for s3 configuration)
 oc apply -f - <<EOF
@@ -675,6 +686,13 @@ EOF
 <summary>Install batch-gateway</summary>
 
 ```bash
+IMAGE_TAG=v0.1.0
+APISERVER_REPO=quay.io/redhat-user-workloads/open-data-hub-tenant/temp-batch-gateway-apiserver
+PROCESSOR_REPO=quay.io/redhat-user-workloads/open-data-hub-tenant/temp-batch-gateway-processor
+GC_REPO=quay.io/redhat-user-workloads/open-data-hub-tenant/temp-batch-gateway-gc
+```
+
+```bash
 # Get model URL from LLMInferenceService
 MODEL_URL=$(oc get llminferenceservice ${ISVC_NAME} -n ${LLM_NS} \
     -o jsonpath='{.status.url}')
@@ -682,6 +700,12 @@ MODEL_URL=$(oc get llminferenceservice ${ISVC_NAME} -n ${LLM_NS} \
 # Install batch-gateway
 helm install batch-gateway ./charts/batch-gateway \
     --namespace ${BATCH_NS} \
+    --set "apiserver.image.repository=${APISERVER_REPO}" \
+    --set "apiserver.image.tag=${IMAGE_TAG}" \
+    --set "processor.image.repository=${PROCESSOR_REPO}" \
+    --set "processor.image.tag=${IMAGE_TAG}" \
+    --set "gc.image.repository=${GC_REPO}" \
+    --set "gc.image.tag=${IMAGE_TAG}" \
     --set "global.secretName=batch-gateway-secrets" \
     --set "global.dbClient.type=postgresql" \
     --set "global.fileClient.type=fs" \
