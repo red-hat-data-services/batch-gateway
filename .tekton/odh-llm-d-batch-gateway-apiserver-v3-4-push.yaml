@@ -1,5 +1,6 @@
 apiVersion: tekton.dev/v1
 kind: PipelineRun
+#
 metadata:
   annotations:
     build.appstudio.openshift.io/repo: https://github.com/red-hat-data-services/batch-gateway?rev={{revision}}
@@ -64,7 +65,7 @@ spec:
     - name: pathInRepo
       value: pipelines/multi-arch-container-build.yaml
   taskRunTemplate:
-    serviceAccountName: build-pipeline-batch-gateway-v3-4
+    serviceAccountName: build-pipeline-batch-gateway-poc
   workspaces:
   - name: git-auth
     secret:
