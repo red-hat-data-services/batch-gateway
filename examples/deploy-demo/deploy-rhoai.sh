@@ -178,7 +178,10 @@ spec:
     protocol: HTTP
     allowedRoutes:
       namespaces:
-        from: All
+        from: Selector
+        selector:
+          matchLabels:
+            llm-d.ai/gateway-route: "true"
   - name: https
     hostname: "${hostname}"
     port: 443
@@ -189,7 +192,10 @@ spec:
       - name: router-certs-default
     allowedRoutes:
       namespaces:
-        from: All
+        from: Selector
+        selector:
+          matchLabels:
+            llm-d.ai/gateway-route: "true"
 EOF
     fi
 
@@ -463,6 +469,7 @@ deploy_llm_inference_service() {
     step "Deploying LLMInferenceService '${isvc_name}' (simulator) in namespace '${LLM_NAMESPACE}'..."
 
     kubectl get namespace "${LLM_NAMESPACE}" &>/dev/null || kubectl create namespace "${LLM_NAMESPACE}"
+    kubectl label namespace "${LLM_NAMESPACE}" llm-d.ai/gateway-route=true --overwrite
 
     if kubectl get llminferenceservice "${isvc_name}" -n "${LLM_NAMESPACE}" &>/dev/null; then
         log "LLMInferenceService '${isvc_name}' already exists. Skipping."

@@ -343,7 +343,10 @@ spec:
     port: 80
     allowedRoutes:
       namespaces:
-        from: All
+        from: Selector
+        selector:
+          matchLabels:
+            llm-d.ai/gateway-route: "true"
   - name: https
     protocol: HTTPS
     port: 443
@@ -353,7 +356,10 @@ spec:
       - name: ${GATEWAY_NAME}-tls
     allowedRoutes:
       namespaces:
-        from: All
+        from: Selector
+        selector:
+          matchLabels:
+            llm-d.ai/gateway-route: "true"
 EOF
 
 # wait for gateway instance is ready
@@ -362,6 +368,8 @@ kubectl wait --for=condition=Programmed --timeout=300s \
 ```
 
 > **Note**: The Gateway uses a self-signed certificate from cert-manager (not OpenShift router certs). Access via `kubectl port-forward` with `-k` (insecure) flag on curl.
+
+> **Security**: The Gateway uses `allowedRoutes.namespaces.from: Selector` to restrict HTTPRoute attachment. Only namespaces labeled with `llm-d.ai/gateway-route: "true"` can attach HTTPRoutes. This must be applied to the batch and LLM namespaces before creating their HTTPRoutes CRs.
 
 </details>
 
@@ -449,6 +457,12 @@ replicaset.apps/ms-llmd-llm-d-modelservice-prefill-7d7b78699f   1         1     
 
 <details>
 <summary>Create HTTPRoute for LLM inference</summary>
+
+Label the LLM namespace so the Gateway's namespace selector allows HTTPRoute attachment:
+
+```bash
+kubectl label namespace ${LLM_NS} llm-d.ai/gateway-route=true
+```
 
 The llm-route is manually created with URL rewrite rules that map `/{namespace}/{model}/v1/*` to the InferencePool backend.
 
@@ -605,6 +619,7 @@ kubectl wait tokenratelimitpolicy/inference-token-limit \
 ```bash
 BATCH_NS=batch-api
 kubectl create namespace "${BATCH_NS}" 2>/dev/null || true
+kubectl label namespace "${BATCH_NS}" llm-d.ai/gateway-route=true
 
 # Install Redis
 helm install redis oci://registry-1.docker.io/bitnamicharts/redis \
