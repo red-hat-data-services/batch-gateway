@@ -2,7 +2,7 @@
 
 This guide demonstrates how to deploy batch-gateway on OpenShift with RHOAI (Red Hat OpenShift AI), using Red Hat Connectivity Link (Kuadrant) for authentication, authorization, and rate limiting.
 
-## 1. Architecture
+## 1. Architecture Overview
 
 ### 1.1 Namespace Layout
 
@@ -37,58 +37,15 @@ This guide demonstrates how to deploy batch-gateway on OpenShift with RHOAI (Red
 
 ### 1.3 Authentication
 
-Both the LLM route and the batch route use **kubernetesTokenReview** for authentication. Clients must provide a valid Kubernetes token via the `Authorization: Bearer <token>` header. The token must include the audience `https://kubernetes.default.svc`.
+Both the LLM route and the batch route use **kubernetesTokenReview** for authentication. Clients provide a valid Kubernetes token via the `Authorization: Bearer <token>` header. The token must include the audience `https://kubernetes.default.svc`. Tokens are typically created from a ServiceAccount using `oc create token`.
 
-```bash
-# Create a token for a ServiceAccount
-oc create token <sa-name> -n <namespace> --audience=https://kubernetes.default.svc --duration=10m
-```
-
-HTTPRoute authentication behavior:
 - **LLM route**: Requires a valid Kubernetes token — unauthenticated requests are rejected with **401**
 - **Batch route**: Requires a valid Kubernetes token — unauthenticated requests are rejected with **401**
 
 ### 1.4 Authorization Model
 
-Users need RBAC `get` permission on the specific `LLMInferenceService` resource to access the model. To grant access, create a Role and RoleBinding:
+Model access is controlled through Kubernetes RBAC. Users need `get` permission on the specific `LLMInferenceService` resource to access a model. This is granted by creating a Role and RoleBinding in the model's namespace (see [Enabling authentication and authorization for LLM inference service](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/deploying_models/deploying_models#enabling-authentication-and-authorization-for-llm-inference-service_rhoai-user) for details).
 
-```bash
-oc apply -f - <<EOF
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: llm-reader
-  namespace: <llm-namespace>
-rules:
-- apiGroups: ["serving.kserve.io"]
-  resources: ["llminferenceservices"]
-  resourceNames: ["<isvc-name>"]
-  verbs: ["get"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: llm-reader-binding
-  namespace: <llm-namespace>
-subjects:
-- kind: ServiceAccount
-  name: <sa-name>
-  namespace: <llm-namespace>
-roleRef:
-  kind: Role
-  name: llm-reader
-  apiGroup: rbac.authorization.k8s.io
-EOF
-```
-
-Verify that the user has access:
-
-```bash
-oc auth can-i get llminferenceservices/<isvc-name> -n <llm-namespace> --as=system:serviceaccount:<namespace>:<sa-name>
-# Expected output: yes
-```
-
-HTTPRoute authorization behavior:
 - **LLM route**: SubjectAccessReview checks if user can `get llminferenceservices/<name>` — unauthorized requests are rejected with **403**
 - **Batch route**: No authorization check — authorization is enforced by the LLM route when the processor forwards inference requests with the user's original token
 
@@ -99,7 +56,7 @@ For security and operations readers: **admission on the batch API is not the sam
 - **batch-route** proves the caller has a valid Kubernetes token and applies batch-side **RateLimitPolicy**. Invalid or missing credentials are rejected with **401**; excess batch API traffic is rejected with **429**. It does **not** evaluate whether the caller may use a specific `LLMInferenceService`.
 - **llm-route** runs **authentication and authorization** (SubjectAccessReview on `llminferenceservices` as above) on each inference request the processor sends through the gateway. A user can create a batch job and still see **per-request failures** (often surfaced as failed lines or job errors) when the llm-route returns **403** — this is **by design**, not a bypass of model access control.
 
-Configure **`passThroughHeaders: {Authorization}`** so the processor forwards the end user’s bearer token on inference calls. Without that, the gateway cannot attribute inference traffic to the original caller and model-level checks cannot run as intended.
+The `Authorization` header is included in `passThroughHeaders` by default. Without it, the gateway cannot attribute inference traffic to the original caller and model-level checks cannot run as intended.
 
 ## 2. Prerequisites
 - OpenShift cluster 4.20 or later (required for Distributed Inference with llm-d).
@@ -275,7 +232,10 @@ spec:
     protocol: HTTP
     allowedRoutes:
       namespaces:
-        from: All
+        from: Selector
+        selector:
+          matchLabels:
+            llm-d.ai/gateway-route: "true"
   - name: https
     hostname: "${HOSTNAME}"
     port: 443
@@ -286,7 +246,10 @@ spec:
       - name: router-certs-default
     allowedRoutes:
       namespaces:
-        from: All
+        from: Selector
+        selector:
+          matchLabels:
+            llm-d.ai/gateway-route: "true"
 EOF
 
 # Wait for the Envoy proxy deployment to become ready
@@ -295,6 +258,8 @@ oc rollout status deployment/openshift-ai-inference-openshift-default -n openshi
 ```
 
 > **Note**: The Gateway uses the OpenShift default router certificate (`router-certs-default`). The hostname must match the cluster's wildcard DNS for external access.
+
+> **Security**: The Gateway uses `allowedRoutes.namespaces.from: Selector` to restrict HTTPRoute attachment. Only namespaces labeled with `llm-d.ai/gateway-route: "true"` can attach HTTPRoutes. This must be applied to the batch and LLM namespaces before creating their HTTPRoutes.
 
 </details>
 
@@ -496,6 +461,8 @@ MODEL_NAME="facebook/opt-125m"
 ISVC_NAME=$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
 
 oc create namespace "${LLM_NS}" 2>/dev/null || true
+# Label namespace for gateway access (required by Gateway namespace selector)
+oc label namespace "${LLM_NS}" llm-d.ai/gateway-route=true
 
 oc apply -f - <<EOF
 apiVersion: serving.kserve.io/v1alpha1
@@ -513,10 +480,6 @@ spec:
   replicas: 2
   router:
     route: {}
-    gateway:
-      refs:
-        - name: openshift-ai-inference
-          namespace: openshift-ingress
     scheduler: {}
   template:
     containers:
@@ -595,6 +558,8 @@ facebook-opt-125m-kserve-route               13m
 
 ### 3.7 Configure TokenRateLimitPolicy for LLMInferenceService
 
+Configure per-user token rate limiting for inference requests. See [Red Hat Connectivity Link docs](https://docs.redhat.com/en/documentation/red_hat_connectivity_link/1.3) for details. The following is an example configuration.
+
 > **Note**: The TokenRateLimitPolicy targets the Gateway (not HTTPRoute) because LLMInferenceService dynamically generates the inference HTTPRoute name.
 
 <details>
@@ -641,13 +606,23 @@ Deploy batch-gateway with the model gateway URL from the LLMInferenceService sta
 ```bash
 BATCH_NS=batch-api
 oc create namespace "${BATCH_NS}" 2>/dev/null || true
+oc label namespace "${BATCH_NS}" llm-d.ai/gateway-route=true
 
-# Install Redis
+# Install Redis (or Valkey — see alternative below)
 helm install redis oci://registry-1.docker.io/bitnamicharts/redis \
     --namespace ${BATCH_NS} --create-namespace \
     --set architecture=standalone \
     --set auth.enabled=false
 oc rollout status statefulset/redis-master -n ${BATCH_NS} --timeout=120s
+
+# Alternative: Install Valkey (wire-protocol compatible with Redis)
+# helm install redis oci://registry-1.docker.io/bitnamicharts/valkey \
+#     --namespace ${BATCH_NS} --create-namespace \
+#     --set architecture=standalone \
+#     --set auth.enabled=false
+# oc rollout status statefulset/redis-valkey-primary -n ${BATCH_NS} --timeout=120s
+# Note: when using Valkey, update the redis-url secret below to use:
+#   redis://redis-valkey-primary.${BATCH_NS}.svc.cluster.local:6379/0
 
 # Install PostgreSQL
 helm install postgresql oci://registry-1.docker.io/bitnamicharts/postgresql \
@@ -717,7 +692,6 @@ helm install batch-gateway ./charts/batch-gateway \
     --set "processor.config.modelGateways.facebook/opt-125m.initialBackoff=1s" \
     --set "processor.config.modelGateways.facebook/opt-125m.maxBackoff=60s" \
     --set "processor.config.modelGateways.facebook/opt-125m.tlsInsecureSkipVerify=true" \
-    --set "apiserver.config.batchAPI.passThroughHeaders={Authorization}" \
     --set apiserver.tls.enabled=true \
     --set apiserver.tls.certManager.enabled=true \
     --set apiserver.tls.certManager.issuerName=selfsigned-issuer \
@@ -726,7 +700,7 @@ helm install batch-gateway ./charts/batch-gateway \
 ```
 
 > - **`modelGateways.<model>.url`**: The processor uses this URL to send inference requests. It should point to the Gateway's model endpoint (from `llminferenceservice.status.url`), not directly to the model server, so that requests go through the Gateway's AuthPolicy and rate limiting.
-> - **`passThroughHeaders: {Authorization}`**: Ensures the processor sends inference requests on behalf of the original user, so the LLM route's AuthPolicy can enforce model-level authorization on batch requests.
+> - **`passThroughHeaders`**: Defaults to `[Authorization]`, so the processor forwards the end user's bearer token on inference calls without extra configuration. Override this only if you need a different set of headers.
 >
 > - **`apiserver.tls.certManager.*`**: Enables TLS for the batch API server using cert-manager. The `issuerName` must match a ClusterIssuer (e.g. `selfsigned-issuer`). The `dnsNames` should include the Service name and FQDN so the Gateway can verify the backend certificate when re-encrypting traffic (see DestinationRule in 3.9).
 > - **File storage**: This example uses `global.fileClient.type=fs` with a PVC. To use S3-compatible storage instead, replace the `fs` options with:
