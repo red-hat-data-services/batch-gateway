@@ -383,7 +383,7 @@ metadata:
   name: rhods-operator
   namespace: redhat-ods-operator
 spec:
-  channel: fast-3.x
+  channel: stable-3.x
   installPlanApproval: Automatic
   name: rhods-operator
   source: redhat-operators
@@ -661,10 +661,10 @@ EOF
 <summary>Install batch-gateway</summary>
 
 ```bash
-IMAGE_TAG=v0.1.0
-APISERVER_REPO=quay.io/redhat-user-workloads/open-data-hub-tenant/temp-batch-gateway-apiserver
-PROCESSOR_REPO=quay.io/redhat-user-workloads/open-data-hub-tenant/temp-batch-gateway-processor
-GC_REPO=quay.io/redhat-user-workloads/open-data-hub-tenant/temp-batch-gateway-gc
+IMAGE_TAG=odh-stable
+APISERVER_REPO=quay.io/opendatahub/odh-llm-d-batch-gateway-apiserver
+PROCESSOR_REPO=quay.io/opendatahub/odh-llm-d-batch-gateway-processor
+GC_REPO=quay.io/opendatahub/odh-llm-d-batch-gateway-gc
 ```
 
 ```bash
