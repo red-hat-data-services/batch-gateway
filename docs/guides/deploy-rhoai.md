@@ -447,6 +447,10 @@ spec:
       rawDeploymentServiceConfig: Headed
       modelsAsService:
         managementState: Removed
+    aigateway:
+      managementState: Managed
+      batchGateway:
+        managementState: Managed
     dashboard:
       managementState: Removed
 EOF
@@ -870,10 +874,18 @@ EOF
 
 </details>
 
-Deploy batch-gateway with the model gateway URL pointing to the Internal Gateway:
+There are two ways to deploy the batch-gateway components. Choose **one** of the following sub-sections:
+
+| | 3.9.1 LLMBatchGateway CR | 3.9.2 Helm chart |
+|---|---|---|
+| **Requires** | RHOAI with `aigateway` enabled ([3.5](#35-install-rhoai)) | `helm` CLI only |
+| **Image management** | Operator-pinned (from RHOAI release) | Manual (set per image) |
+| **Lifecycle** | Declarative CR, operator reconciles | Helm release |
+
+Both options require the same dependencies (Redis, PostgreSQL, MinIO) and produce the same result.
 
 <details>
-<summary>Create namespace and install dependencies</summary>
+<summary>Create namespace and install dependencies (required for both options)</summary>
 
 ```bash
 oc create namespace "${BATCH_NS}" 2>/dev/null || true
@@ -983,14 +995,94 @@ oc create secret generic batch-gateway-secrets \
 
 </details>
 
+#### 3.9.1 Option A: Deploy via LLMBatchGateway CR
+
+> **Prerequisite**: The DataScienceCluster must have `aigateway.managementState: Managed` with `aigateway.batchGateway.managementState: Managed` (see [3.5](#35-install-rhoai)). This deploys the ai-gateway-operator, which in turn deploys the batch-gateway-operator.
+
 <details>
-<summary>Install batch-gateway</summary>
+<summary>Create LLMBatchGateway CR</summary>
 
 ```bash
-IMAGE_TAG=odh-stable
-APISERVER_REPO=quay.io/opendatahub/odh-llm-d-batch-gateway-apiserver
-PROCESSOR_REPO=quay.io/opendatahub/odh-llm-d-batch-gateway-processor
-GC_REPO=quay.io/opendatahub/odh-llm-d-batch-gateway-gc
+# Get model URL from the Internal Gateway service
+INTERNAL_GW_SVC=$(oc get svc -n openshift-ingress \
+    -l "gateway.networking.k8s.io/gateway-name=batch-internal-gateway" \
+    -o jsonpath='{.items[0].metadata.name}')
+MODEL_URL="http://${INTERNAL_GW_SVC}.openshift-ingress.svc.cluster.local/${LLM_NS}/${ISVC_NAME}"
+
+oc apply -f - <<EOF
+apiVersion: batch.llm-d.ai/v1alpha1
+kind: LLMBatchGateway
+metadata:
+  name: batch-gateway
+  namespace: ${BATCH_NS}
+spec:
+  secretRef:
+    name: batch-gateway-secrets
+  dbBackend: postgresql
+  fileStorage:
+    s3:
+      region: us-east-1
+      endpoint: http://minio.${BATCH_NS}.svc.cluster.local:9000
+      accessKeyId: ${MINIO_USER}
+      prefix: ${MINIO_BUCKET}
+      usePathStyle: true
+      autoCreateBucket: true
+  apiServer:
+    replicas: 1
+  processor:
+    replicas: 1
+    globalInferenceGateway:
+      url: ${MODEL_URL}
+      requestTimeout: 5m
+      maxRetries: 3
+      initialBackoff: 1s
+      maxBackoff: 60s
+    config:
+      inferenceObjective: batch-sheddable
+  gc:
+    interval: 30m
+  tls:
+    enabled: true
+    certManager:
+      issuerName: selfsigned-issuer
+      issuerKind: ClusterIssuer
+      dnsNames:
+      - batch-gateway-apiserver
+      - batch-gateway-apiserver.${BATCH_NS}.svc.cluster.local
+      - localhost
+EOF
+
+# Wait for the batch gateway to be ready
+oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
+    --for=condition=Ready --timeout=300s
+```
+
+> - **`processor.globalInferenceGateway.url`**: Points to the Internal Gateway's model endpoint. The Internal Gateway enforces AuthPolicy (model access check) but not TokenRateLimitPolicy.
+> - **`processor.config.inferenceObjective`**: The `InferenceObjective` CRD name sent as the `x-gateway-inference-objective` header. EPP uses this to assign the request to the batch priority band (priority -1, sheddable).
+> - **`tls.certManager`**: Enables TLS for the batch API server using cert-manager. In this demo the DestinationRule (see [3.10](#310-configure-httproute-and-policies-for-batch-gateway)) uses `insecureSkipVerify: true` because we use a self-signed certificate; in production, configure a trusted CA.
+> - **Images**: The operator pins component images (apiserver, processor, gc) from its deployment configuration. You do not set image references in the CR.
+> - **File storage**: This example uses S3-compatible storage (MinIO). To use a PVC instead, replace `fileStorage.s3` with:
+>   ```yaml
+>   fileStorage:
+>     fs:
+>       basePath: /tmp/batch-gateway
+>       claimName: batch-gateway-files
+>   ```
+>   The PVC must have `ReadWriteMany` access mode (requires NFS, CephFS, or similar).
+
+</details>
+
+#### 3.9.2 Option B: Deploy via Helm chart
+
+<details>
+<summary>Install batch-gateway with Helm</summary>
+
+```bash
+CHART_VERSION=0.2.0
+IMAGE_TAG=rhoai-3.5-ea.2
+APISERVER_REPO=quay.io/rhoai/odh-llm-d-batch-gateway-apiserver-rhel9
+PROCESSOR_REPO=quay.io/rhoai/odh-llm-d-batch-gateway-processor-rhel9
+GC_REPO=quay.io/rhoai/odh-llm-d-batch-gateway-gc-rhel9
 ```
 
 ```bash
@@ -1000,8 +1092,10 @@ INTERNAL_GW_SVC=$(oc get svc -n openshift-ingress \
     -o jsonpath='{.items[0].metadata.name}')
 MODEL_URL="http://${INTERNAL_GW_SVC}.openshift-ingress.svc.cluster.local/${LLM_NS}/${ISVC_NAME}"
 
-# Install batch-gateway
-helm upgrade --install batch-gateway ./charts/batch-gateway \
+# Install batch-gateway from OCI chart
+helm upgrade --install batch-gateway \
+    oci://ghcr.io/llm-d-incubation/charts/batch-gateway \
+    --version ${CHART_VERSION} \
     --namespace ${BATCH_NS} \
     --set "apiserver.image.repository=${APISERVER_REPO}" \
     --set "apiserver.image.tag=${IMAGE_TAG}" \
@@ -1035,7 +1129,7 @@ helm upgrade --install batch-gateway ./charts/batch-gateway \
 > - **`modelGateways.<model>.url`**: The processor uses this URL to send inference requests. It points to the Internal Gateway's model endpoint (discovered from the Internal Gateway Service), not the external Gateway or the model server directly. The Internal Gateway enforces AuthPolicy (model access check) but not TokenRateLimitPolicy.
 > - **`passThroughHeaders`**: Defaults to `[Authorization]`, so the processor forwards the end user's bearer token on inference calls without extra configuration. Override this only if you need a different set of headers.
 >
-> - **`apiserver.tls.certManager.*`**: Enables TLS for the batch API server using cert-manager. The `issuerName` must match a ClusterIssuer (e.g. `selfsigned-issuer`). The `dnsNames` should include the Service name and FQDN for TLS certificate generation. In this demo the DestinationRule (see 3.9) uses `insecureSkipVerify: true` because we use a self-signed certificate; in production, configure a trusted CA and set `insecureSkipVerify: false`.
+> - **`apiserver.tls.certManager.*`**: Enables TLS for the batch API server using cert-manager. The `issuerName` must match a ClusterIssuer (e.g. `selfsigned-issuer`). The `dnsNames` should include the Service name and FQDN for TLS certificate generation. In this demo the DestinationRule (see 3.10) uses `insecureSkipVerify: true` because we use a self-signed certificate; in production, configure a trusted CA and set `insecureSkipVerify: false`.
 > - **File storage**: This example uses S3-compatible storage (MinIO). To use a PVC instead, replace the `s3` options with:
 >   ```
 >   --set "global.fileClient.type=fs"
