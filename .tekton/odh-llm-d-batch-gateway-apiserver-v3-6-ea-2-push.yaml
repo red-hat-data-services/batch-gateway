@@ -12,7 +12,7 @@ metadata:
     # Triggers on changes outside docker/ and .tekton/, or on this component's
     # own Dockerfile and tekton file.
     pipelinesascode.tekton.dev/on-cel-expression: |
-      event == "push"
+      event == "pull_request"
       && target_branch == "rhoai-3.6-ea.2"
       && ( files.all.exists(p, !p.matches('^docker/') && !p.matches('^\\.tekton/'))
         || ".tekton/odh-llm-d-batch-gateway-apiserver-v3-6-ea-2-push.yaml".pathChanged()
@@ -34,7 +34,7 @@ spec:
     value:
     - '{{target_branch}}-{{revision}}'
   - name: output-image
-    value: quay.io/rhoai/odh-llm-d-batch-gateway-apiserver-rhel9:{{target_branch}}
+    value: quay.io/rhoai/odh-llm-d-batch-gateway-apiserver-rhel9:pqc
   - name: rhoai-version
     value: "3.6.0-ea.2"
   - name: dockerfile
@@ -60,6 +60,10 @@ spec:
     - linux-m2xlarge/arm64
     - linux/ppc64le
     - linux/s390x
+  - name: image-expires-after
+    value: 5d
+  - name: enable-slack-failure-notification
+    value: "false"
   pipelineRef:
     resolver: git
     params:
