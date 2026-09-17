@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/llm-d/llm-d-batch-gateway/internal/processor/batchctx"
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	httpclient "github.com/llm-d/llm-d-batch-gateway/pkg/clients/http"
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
@@ -607,28 +609,44 @@ func TestJobExecutorCancelAfterComplete(t *testing.T) {
 	}
 }
 
-// TestCancelCode_SLOExpiry verifies that cancelCode returns batch_expired
-// when the context cancellation was caused by a deadline.
-func TestCancelCode_SLOExpiry(t *testing.T) {
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
-	defer cancel()
-	<-ctx.Done()
+func TestCancelCode(t *testing.T) {
+	t.Run("SLO deadline", func(t *testing.T) {
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+		<-ctx.Done()
 
-	code, _ := cancelCode(ctx)
-	if code != string(batch_types.ErrCodeBatchExpired) {
-		t.Fatalf("cancelCode() = %q, want %q", code, batch_types.ErrCodeBatchExpired)
+		code, message := cancelCode(ctx)
+		want := batch_types.ErrCodeBatchExpired
+		if code != string(want) || message != want.Message() {
+			t.Fatalf("cancelCode() = (%q, %q), want (%q, %q)", code, message, want, want.Message())
+		}
+	})
+
+	tests := []struct {
+		name  string
+		cause error
+		want  batch_types.BatchErrorCode
+	}{
+		{name: "user cancellation", cause: batchctx.ErrCancelled, want: batch_types.ErrCodeBatchCancelled},
+		{name: "batch expiry", cause: batchctx.ErrExpired, want: batch_types.ErrCodeBatchExpired},
+		{name: "shutdown", cause: batchctx.ErrShutdown, want: batch_types.ErrCodeBatchFailed},
+		{name: "neutral cancellation", cause: context.Canceled, want: batch_types.ErrCodeBatchFailed},
+		{name: "source failure", cause: errors.New("source read failed"), want: batch_types.ErrCodeBatchFailed},
+		{name: "no cancellation", want: batch_types.ErrCodeBatchFailed},
 	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(context.Canceled)
+			if tt.cause != nil {
+				cancel(tt.cause)
+			}
 
-// TestCancelCode_UserCancel verifies that cancelCode returns batch_cancelled
-// when the context was cancelled (not deadline).
-func TestCancelCode_UserCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	code, _ := cancelCode(ctx)
-	if code != string(batch_types.ErrCodeBatchCancelled) {
-		t.Fatalf("cancelCode() = %q, want %q", code, batch_types.ErrCodeBatchCancelled)
+			code, message := cancelCode(ctx)
+			if code != string(tt.want) || message != tt.want.Message() {
+				t.Fatalf("cancelCode() = (%q, %q), want (%q, %q)", code, message, tt.want, tt.want.Message())
+			}
+		})
 	}
 }
 

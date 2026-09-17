@@ -19,7 +19,7 @@ This document describes the design of the request and result queues that connect
 The batch-processor supports two mutually exclusive dispatch modes, selected via `dispatch_mode`:
 
 - **`sync`** (default): The executor dispatches inference requests directly to the inference gateway via HTTP, using the existing AIMD + semaphore flow control.
-- **`async`**: The executor enqueues individual requests into **the dispatcher's request queue**; **the dispatcher pulls and forwards** them to the inference gateway based on the [dispatch budget](https://github.com/llm-d/llm-d-async/blob/main/docs/dispatch-budget.md). A **result consumer** in the batch-processor reads completed responses from **the dispatcher's result queue** and routes them back to the appropriate job's output writer.
+- **`async`** (opt-in): The executor enqueues individual requests into **the dispatcher's request queue**; **the dispatcher pulls and forwards** them to the inference gateway based on the [dispatch budget](https://github.com/llm-d/llm-d-async/blob/main/docs/dispatch-budget.md). A **result consumer** in the batch-processor reads completed responses from **the dispatcher's result queue** and routes them back to the appropriate job's output writer.
 
 This document describes the **async** dispatch mode and its queue design.
 
@@ -70,7 +70,7 @@ When the dispatcher is used, the inference gateway endpoint configuration lives 
 
 ### Batch-Processor Configuration
 
-The batch-processor selects the dispatch backend via `dispatch_mode: sync | async`. In `sync` mode (default), the executor dispatches directly via HTTP using the existing AIMD + semaphore flow. In `async` mode, the executor enqueues to the dispatcher's request queue and collects results from the result queue.
+The batch-processor selects the dispatch backend via `dispatch_mode: sync | async`. In the default `sync` mode, it dispatches directly via HTTP using the existing AIMD + semaphore flow. In opt-in `async` mode, the executor enqueues to the dispatcher's request queue and collects results from the result queue.
 
 Each model resolves to an `inference_pool_name` that derives the queue pair. The config uses `dispatch_mode` on `ProcessorConfig` and `inference_pool_name` on each `ModelGatewayConfig` entry (see [#430](https://github.com/llm-d/llm-d-batch-gateway/pull/430)):
 

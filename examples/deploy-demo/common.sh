@@ -94,6 +94,7 @@ BATCH_APISERVER_REPO="${BATCH_APISERVER_REPO:-}"
 BATCH_PROCESSOR_REPO="${BATCH_PROCESSOR_REPO:-}"
 BATCH_GC_REPO="${BATCH_GC_REPO:-}"
 
+# HTTP sync dispatch is the demo default; async dispatch is opt-in.
 ENABLE_DISPATCHER="${ENABLE_DISPATCHER:-false}"
 
 # Temp directory cleanup (used by do_deploy_batch_gateway_helm)

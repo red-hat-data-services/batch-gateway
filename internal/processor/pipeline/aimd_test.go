@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-logr/logr"
 
+	"github.com/llm-d/llm-d-batch-gateway/internal/processor/batchctx"
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/semaphore"
 	httpclient "github.com/llm-d/llm-d-batch-gateway/pkg/clients/http"
@@ -375,10 +376,11 @@ func TestCancelDrainsUndispatched(t *testing.T) {
 	sem, aimd := makeEndpointAIMD(t, 2)
 	globalLimit := 2
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
 	items := makeItems(10, "m1")
 
-	source := &cancelAfterNSource{items: items, cancelAt: 3, cancelFn: cancel}
+	source := &cancelAfterNSource{items: items, cancelAt: 3, cancelFn: func() { cancel(batchctx.ErrCancelled) }}
 
 	outputFile := tempFile(t)
 	errorFile := tempFile(t)

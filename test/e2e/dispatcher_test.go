@@ -32,6 +32,7 @@ import (
 	"github.com/llm-d/llm-d-async/producer"
 	"github.com/openai/openai-go/v3"
 	"github.com/redis/go-redis/v9"
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -92,21 +93,60 @@ func newDispatcherProducer(t *testing.T, rdb *redis.Client, poolName string) *pr
 	return p
 }
 
-// detectDispatcherDeployed checks whether at least one llm-d Async deployment
-// exists in the test namespace.
+// detectDispatcherDeployed checks the processor's active dispatch mode. This
+// avoids treating stale llm-d-async deployments as evidence that the processor
+// is still configured for async dispatch.
 func detectDispatcherDeployed(t *testing.T) bool {
 	t.Helper()
 
-	out, err := exec.Command("kubectl", "get", "deployments",
+	configMap := fmt.Sprintf("%s-processor-config", testHelmRelease)
+	out, err := exec.Command("kubectl", "get", "configmap", configMap,
 		"-n", testNamespace,
-		"-l", "app.kubernetes.io/name in (async-processor,llm-d-async)",
-		"-o", "name",
+		"-o", "jsonpath={.data.config\\.yaml}",
 	).CombinedOutput()
 	if err != nil {
-		t.Logf("kubectl get deployments failed: %v", err)
+		t.Logf("kubectl get processor config failed: %v\n%s", err, out)
 		return false
 	}
-	return strings.TrimSpace(string(out)) != ""
+	dispatchMode, err := processorDispatchMode(out)
+	if err != nil {
+		t.Logf("parse processor config failed: %v", err)
+		return false
+	}
+	return dispatchMode == "async"
+}
+
+func processorDispatchMode(data []byte) (string, error) {
+	var cfg struct {
+		DispatchMode string `yaml:"dispatch_mode"`
+	}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return "", err
+	}
+	return cfg.DispatchMode, nil
+}
+
+func TestProcessorDispatchMode(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{name: "async", data: `dispatch_mode: "async"`, want: "async"},
+		{name: "sync", data: `dispatch_mode: "sync"`, want: "sync"},
+		{name: "omitted", data: `poll_interval: "5s"`, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := processorDispatchMode([]byte(tt.data))
+			if err != nil {
+				t.Fatalf("processorDispatchMode() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("processorDispatchMode() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
 
 func TestDispatcher(t *testing.T) {

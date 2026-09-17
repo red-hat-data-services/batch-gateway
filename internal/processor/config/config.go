@@ -309,8 +309,8 @@ func (pc *ProcessorConfig) LoadFromYAML(filePath string) error {
 }
 
 // NewConfig returns a new ProcessorConfig with default values.
-// Gateway fields (GlobalInferenceGateway, ModelGateways) are intentionally
-// left nil — the user must configure exactly one via YAML or env.
+// Dispatch targets are intentionally left nil: configure a global or per-model
+// gateway, or explicitly select async and configure async_dispatch.models.
 // TaskWaitTime has to be shorter than poll interval.
 func NewConfig() *ProcessorConfig {
 	return &ProcessorConfig{
@@ -466,10 +466,10 @@ func (c *ProcessorConfig) validateAsyncDispatchConfig() error {
 		return fmt.Errorf("async_dispatch.result_poll_timeout must be > 0")
 	}
 	if c.GlobalInferenceGateway != nil {
-		return fmt.Errorf("global_inference_gateway is not supported with dispatch_mode %q; use async_dispatch.models", DispatchModeAsync)
+		return fmt.Errorf("global_inference_gateway is not supported with dispatch_mode %q; use async_dispatch.models instead or explicitly set dispatch_mode: sync", DispatchModeAsync)
 	}
 	if len(c.AsyncDispatchConfig.Models) == 0 {
-		return fmt.Errorf("async_dispatch.models must be configured when dispatch_mode is %q", DispatchModeAsync)
+		return fmt.Errorf("async_dispatch.models must be configured when dispatch_mode is %q; configure async mappings or explicitly set dispatch_mode: sync to use global_inference_gateway or model_gateways", DispatchModeAsync)
 	}
 	for model, m := range c.AsyncDispatchConfig.Models {
 		if m.InferencePoolName == "" {
@@ -614,7 +614,7 @@ type ResolvedGateways struct {
 
 // ResolveModelGateways resolves API keys for all configured gateways and returns
 // a ResolvedGateways ready to pass to the inference client resolver.
-// Validate() ensures exactly one of GlobalInferenceGateway or ModelGateways is set.
+// Validate() ensures dispatch targets are configured for the selected mode.
 func ResolveModelGateways(cfg *ProcessorConfig) (*ResolvedGateways, error) {
 	result := &ResolvedGateways{}
 

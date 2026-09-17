@@ -12,9 +12,13 @@ tests:
       - notMatchRegex:
           path: data["config.yaml"]
           pattern: 'model_gateways:'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'dispatch_mode: "sync"'
 
   - it: should default tls_insecure_skip_verify to false when omitted from global_inference_gateway
     set:
+      processor.config.dispatchMode: sync
       processor.config.globalInferenceGateway:
         url: "http://global-gw:8000"
         requestTimeout: "5m"
@@ -29,6 +33,7 @@ tests:
 
   - it: should default tls_insecure_skip_verify to false when omitted from model gateway
     set:
+      processor.config.dispatchMode: sync
       processor.config.modelGateways:
         "llama-3":
           url: "http://gw:8000"
@@ -43,6 +48,7 @@ tests:
 
   - it: should render global_inference_gateway when set
     set:
+      processor.config.dispatchMode: sync
       processor.config.globalInferenceGateway:
         url: "http://global-gw:8000"
         requestTimeout: "5m"
@@ -57,6 +63,9 @@ tests:
           pattern: 'global_inference_gateway:'
       - matchRegex:
           path: data["config.yaml"]
+          pattern: 'dispatch_mode: "sync"'
+      - matchRegex:
+          path: data["config.yaml"]
           pattern: 'url: "http://global-gw:8000"'
       - notMatchRegex:
           path: data["config.yaml"]
@@ -64,6 +73,7 @@ tests:
 
   - it: should render global_inference_gateway optional fields only when set
     set:
+      processor.config.dispatchMode: sync
       processor.config.globalInferenceGateway:
         url: "http://global-gw:8000"
         requestTimeout: "5m"
@@ -135,6 +145,7 @@ tests:
 
   - it: should render per-model gateway entries
     set:
+      processor.config.dispatchMode: sync
       processor.config.modelGateways:
         "llama-3":
           url: "http://llama-gw:8000"
@@ -156,6 +167,9 @@ tests:
           pattern: '"llama-3":'
       - matchRegex:
           path: data["config.yaml"]
+          pattern: 'dispatch_mode: "sync"'
+      - matchRegex:
+          path: data["config.yaml"]
           pattern: 'url: "http://llama-gw:8000"'
       - matchRegex:
           path: data["config.yaml"]
@@ -169,6 +183,7 @@ tests:
 
   - it: should not contain stale model entries when a model is removed
     set:
+      processor.config.dispatchMode: sync
       processor.config.modelGateways:
         "llama-3":
           url: "http://gw:8000"
@@ -187,6 +202,7 @@ tests:
 
   - it: should render explicit zero maxRetries as 0 in model_gateways
     set:
+      processor.config.dispatchMode: sync
       processor.config.modelGateways:
         "llama-3":
           url: "http://gw:8000"
@@ -202,6 +218,7 @@ tests:
 
   - it: should render apiKeyName only when set
     set:
+      processor.config.dispatchMode: sync
       processor.config.modelGateways:
         "llama-3":
           url: "http://gw:8000"
@@ -224,6 +241,7 @@ tests:
 
   - it: should render TLS fields only when set
     set:
+      processor.config.dispatchMode: sync
       processor.config.modelGateways:
         "llama-3":
           url: "http://gw:8000"
@@ -281,6 +299,7 @@ tests:
 
   - it: should render per-model inferenceObjective when set
     set:
+      processor.config.dispatchMode: sync
       processor.config.modelGateways:
         "llama-3":
           url: "http://gie-a-epp:8081"
@@ -306,6 +325,7 @@ tests:
 
   - it: should not render per-model inferenceObjective when empty
     set:
+      processor.config.dispatchMode: sync
       processor.config.modelGateways:
         "llama-3":
           url: "http://gw:8000"
@@ -323,6 +343,7 @@ tests:
 
   - it: should render inferenceObjective on global_inference_gateway when set
     set:
+      processor.config.dispatchMode: sync
       processor.config.globalInferenceGateway:
         url: "http://global-gw:8000"
         inferenceObjective: "batch-sheddable-global"
@@ -338,6 +359,7 @@ tests:
 
   - it: should not render inferenceObjective on global_inference_gateway when empty
     set:
+      processor.config.dispatchMode: sync
       processor.config.globalInferenceGateway:
         url: "http://global-gw:8000"
         requestTimeout: "5m"

@@ -1,0 +1,10 @@
+suite: processor configmap fail guards
+templates:
+  - templates/processor-configmap.yaml
+tests:
+  - it: should fail when async model mappings are empty
+    set:
+      processor.config.dispatchMode: async
+    asserts:
+      - failedTemplate:
+          errorMessage: "processor.config.asyncDispatch.models must be configured when dispatchMode is async"

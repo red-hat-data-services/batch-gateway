@@ -39,6 +39,7 @@ work_dir: "/var/lib/batch-gateway/processor"
 
 # Inference gateway configuration.
 # Either global_inference_gateway or model_gateways must be configured.
+dispatch_mode: sync
 #
 # Option 1: global_inference_gateway routes ALL requests to one endpoint.
 # Use for MaaS / multi-model platforms or LoRA-only deployments

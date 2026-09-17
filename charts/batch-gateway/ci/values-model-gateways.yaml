@@ -7,6 +7,7 @@ global:
 
 processor:
   config:
+    dispatchMode: sync
     modelGateways:
       "llama-3":
         url: "http://gie-a-epp:8081"

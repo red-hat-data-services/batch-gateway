@@ -169,10 +169,11 @@ test:
 	rm -f $$OUT; \
 	exit $$TEST_EXIT
 
-## test-scripts: Run shell script tests (stubbed-gh, no cluster/network needed)
+## test-scripts: Run shell script tests (stubbed tools, no cluster/network needed)
 test-scripts:
 	@echo "Running shell script tests..."
 	@bash scripts/generate-release_test.sh
+	@bash scripts/dev-deploy_test.sh
 
 ## test-coverage: Run tests with coverage
 test-coverage:
@@ -337,13 +338,13 @@ test-all: test test-regression test-integration test-scripts
 
 KIND_CLUSTER_NAME ?= batch-gateway-dev
 
-## dev-deploy: Deploy batch-gateway to a local kind cluster with all dependencies
+## dev-deploy: Deploy batch-gateway in sync mode (set ENABLE_DISPATCHER=true for async fixtures)
 dev-deploy:
 	@bash scripts/dev-deploy.sh
 
-## dev-deploy-gie: Deploy with GIE integration (per-model EPP + InferenceObjectives)
+## dev-deploy-gie: Deploy with sync GIE integration (per-model EPP + InferenceObjectives)
 dev-deploy-gie:
-	@ENABLE_GIE=true bash scripts/dev-deploy.sh
+	@ENABLE_DISPATCHER=false ENABLE_GIE=true bash scripts/dev-deploy.sh
 
 ## dev-clean: Clean up dev deployment (removes all resources but keeps the kind cluster)
 dev-clean:

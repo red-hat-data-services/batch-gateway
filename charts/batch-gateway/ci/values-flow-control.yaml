@@ -10,6 +10,7 @@ global:
 
 processor:
   config:
+    dispatchMode: sync
     globalInferenceGateway:
       url: "http://inference-gateway:8000"
       inferenceObjective: "batch-sheddable"

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/llm-d/llm-d-batch-gateway/internal/processor/batchctx"
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 )
 
@@ -109,8 +110,8 @@ func TestPreDispatcher(t *testing.T) {
 		requestCh := make(chan RequestItem, 3)
 		resultCh := make(chan ResultItem, 6)
 
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel() // cancel immediately
+		ctx, cancel := context.WithCancelCause(context.Background())
+		cancel(batchctx.ErrCancelled)
 
 		requestCh <- RequestItem{RequestID: "r1", ModelID: "m1"}
 		requestCh <- RequestItem{RequestID: "r2", ModelID: "m1"}
