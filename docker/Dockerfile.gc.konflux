@@ -25,7 +25,7 @@ RUN mkdir -p bin && \
     CGO_ENABLED=${CGO_ENABLED} GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -o bin/batch-gateway-gc ./cmd/batch-gc
 
 # TODO: switch base image to gcr.io/distroless/static:nonroot before release
-FROM registry.access.redhat.com/ubi9/ubi-micro:latest
+FROM registry.access.redhat.com/ubi9/ubi-micro:latest@sha256:5be877a2a280ae36eb9ab80ca4efb28bbf77c57abbba38137cdc37a03b8465e6
 WORKDIR /
 COPY --from=builder /opt/app-root/src/bin/batch-gateway-gc /app/batch-gateway-gc
 USER 1001:1001
