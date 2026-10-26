@@ -42,7 +42,7 @@ func TestBroadcasterRegistry_RecoveryRoutes(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
 
-	resolver, err := inference.NewAsyncResolver(inference.AsyncClientConfig{
+	resolver, err := inference.NewAsyncResolver(context.Background(), inference.AsyncClientConfig{
 		RedisURL:          "redis://" + mr.Addr(),
 		ConsumerID:        "proc-b",
 		ResultPollTimeout: 2 * time.Second,
@@ -205,7 +205,7 @@ func TestBroadcasterRegistry_RecoveryGatedOnSubscription(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
 
-	resolver, err := inference.NewAsyncResolver(inference.AsyncClientConfig{
+	resolver, err := inference.NewAsyncResolver(context.Background(), inference.AsyncClientConfig{
 		RedisURL:          "redis://" + mr.Addr(),
 		ConsumerID:        "proc-b",
 		ResultPollTimeout: 2 * time.Second,
@@ -285,7 +285,7 @@ func TestBroadcasterRegistry_MisClaimCompetingReplicas(t *testing.T) {
 
 	newResolver := func(consumerID string) *inference.AsyncGatewayResolver {
 		t.Helper()
-		r, err := inference.NewAsyncResolver(inference.AsyncClientConfig{
+		r, err := inference.NewAsyncResolver(context.Background(), inference.AsyncClientConfig{
 			RedisURL:          "redis://" + mr.Addr(),
 			ConsumerID:        consumerID,
 			ResultPollTimeout: 2 * time.Second,
@@ -294,7 +294,7 @@ func TestBroadcasterRegistry_MisClaimCompetingReplicas(t *testing.T) {
 			},
 		}, logr.Discard())
 		if err != nil {
-			t.Fatalf("NewAsyncResolver(%s): %v", consumerID, err)
+			t.Fatalf("NewAsyncResolver(context.Background(), %s): %v", consumerID, err)
 		}
 		t.Cleanup(func() { _ = r.Close() })
 		return r
