@@ -3,7 +3,7 @@ module github.com/llm-d/llm-d-batch-gateway
 go 1.26.0
 
 require (
-	github.com/alicebob/miniredis/v2 v2.39.0
+	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/aws/aws-sdk-go-v2 v1.47.4
 	github.com/aws/aws-sdk-go-v2/config v1.33.10
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.10
@@ -18,7 +18,7 @@ require (
 	github.com/llm-d/llm-d-async/producer v1.0.0
 	github.com/llm-d/llm-d-async/producer-sql v0.0.0-20261021222928-3c134ef6d2ce
 	github.com/pashagolub/pgxmock/v5 v5.2.0
-	github.com/prometheus/client_golang v1.24.1
+	github.com/prometheus/client_golang v1.25.0
 	github.com/quasilyte/go-ruleguard/dsl v0.3.23
 	github.com/redis/go-redis/v9 v9.22.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
