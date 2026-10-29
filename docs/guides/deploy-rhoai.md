@@ -62,20 +62,20 @@ The `Authorization` header is included in `passThroughHeaders` by default. Witho
 
 ### 1.6 Flow Control
 
-Flow control ensures interactive inference requests are always served before batch requests. The EPP (Endpoint Picker Plugin) uses GIE's flow control feature to assign requests to priority bands based on the `x-gateway-inference-objective` header:
+Flow control ensures interactive inference requests are always served before batch requests. The EPP (Endpoint Picker Plugin) uses GIE's flow control feature to assign requests to priority bands based on the `x-llm-d-inference-objective` header (`x-gateway-inference-objective` is a deprecated alias):
 
 | Priority Band | Priority | Workload | Behavior Under Saturation |
 |---------------|----------|----------|---------------------------|
 | Interactive | 100 | Interactive requests | Dispatched first |
 | Default | 0 | Requests without an objective header | Dispatched before batch |
-| Batch | -1 (sheddable) | Batch requests | Shed immediately; processor retries with backoff |
+| Batch | -1 (sheddable) | Batch requests | Queued: shed on TTL expiry or band capacity (429, or 503 with no endpoints). In flight: revoked with 429 when higher-priority work is blocked (`enableEviction`, recommended on). Retries come from the processor (sync) or llm-d-async (async) |
 
-When the backend is not saturated, both interactive and batch requests are dispatched freely. When saturation reaches 1.0, batch requests (priority -1) are shed at admission while interactive requests continue to be served.
+When the backend is not saturated, both interactive and batch requests are dispatched freely. When saturation reaches 1.0, head-of-line blocking pauses dispatch; interactive requests resume first, and batch requests wait in the batch band until their TTL expires or the band's capacity is exhausted. With `enableEviction` enabled (the recommended setting), a batch request that is already in flight is also revoked so the engine stops working on it while interactive traffic is waiting.
 
 This is configured through three components:
 
 1. **EndpointPickerConfig** in the LLMInferenceService CR (`spec.router.scheduler.config.inline`) enables the `flowControl` feature gate and defines priority bands, fairness policies, and saturation detection thresholds.
-2. **InferenceObjective CRDs** map objective names to priority levels. The batch processor sends the `x-gateway-inference-objective: batch-sheddable` header, which EPP resolves to priority -1.
+2. **InferenceObjective CRDs** map objective names to priority levels. The batch processor sends the `x-llm-d-inference-objective: batch-sheddable` header, which EPP resolves to priority -1. Create them in the `llm-d.ai` group (see [3.7](#37-create-inferenceobjective-crds)).
 3. **Batch processor `inferenceObjective` config** sets which `InferenceObjective` name is sent in the header on each inference request.
 
 For full details on flow control configuration, see the [Flow Control Setup Guide](flow-control-setup.md).
@@ -513,7 +513,7 @@ spec:
     scheduler:
       config:
         inline:
-          apiVersion: inference.networking.x-k8s.io/v1alpha1
+          apiVersion: llm-d.ai/v1alpha1
           kind: EndpointPickerConfig
           featureGates:
             - "flowControl"
@@ -526,11 +526,12 @@ spec:
                 queueDepthThreshold: 5
                 kvCacheUtilThreshold: 0.8
           schedulingProfiles: []
-          saturationDetector:
-            pluginRef: utilization-detector
           flowControl:
             maxBytes: 4294967296
             defaultRequestTTL: 30s
+            enableEviction: true
+            saturationDetector:
+              pluginRef: utilization-detector
             priorityBands:
               - priority: 100
                 maxBytes: 1073741824
@@ -538,6 +539,7 @@ spec:
                 orderingPolicyRef: fcfs-ordering-policy
               - priority: -1
                 maxBytes: 3221225472
+                defaultRequestTTL: 120s
                 fairnessPolicyRef: global-strict-fairness-policy
                 orderingPolicyRef: slo-deadline-ordering-policy
             defaultPriorityBand:
@@ -587,7 +589,7 @@ oc wait llminferenceservice/${ISVC_NAME} -n ${LLM_NS} \
 ```
 > **Key annotation**: `security.opendatahub.io/enable-auth: "true"` enables the Gateway-level AuthPolicy that uses SubjectAccessReview to check if the user has RBAC permission to `get` the specific `LLMInferenceService` resource.
 
-> **Flow control config**: The `scheduler.config.inline` EndpointPickerConfig enables the `flowControl` feature gate with two priority bands: interactive (priority 100, round-robin fairness, FCFS ordering) and batch (priority -1, sheddable, SLO-deadline ordering). The `saturationDetector` monitors backend queue depth and KV-cache utilization to trigger head-of-line blocking when the system is saturated. See [1.6 Flow Control](#16-flow-control) for details.
+> **Flow control config**: The `scheduler.config.inline` EndpointPickerConfig enables the `flowControl` feature gate with two priority bands: interactive (priority 100, round-robin fairness, FCFS ordering) and batch (priority -1, sheddable, SLO-deadline ordering, longer queue TTL). `enableEviction: true` lets the EPP revoke in-flight batch requests when interactive traffic is blocked, and the `saturationDetector` (nested under `flowControl` since llm-d-router v0.11.0) monitors backend queue depth and KV-cache utilization to trigger head-of-line blocking when the system is saturated. An inline config replaces the platform's default EPPConfig preset rather than merging with it, so it must list every plugin it references. See [1.6 Flow Control](#16-flow-control) and the [Flow Control Setup Guide](flow-control-setup.md) for details.
 </details>
 
 <details>
@@ -623,7 +625,7 @@ facebook-opt-125m-kserve-route               13m
 
 ### 3.7 Create InferenceObjective CRDs
 
-Create `InferenceObjective` resources that map the `x-gateway-inference-objective` header value to a priority band in EPP's flow control. The batch processor sends the `batch-sheddable` objective on each inference request.
+Create `InferenceObjective` resources that map the `x-llm-d-inference-objective` header value to a priority band in EPP's flow control. The batch processor sends the `batch-sheddable` objective on each inference request.
 
 <details>
 <summary>Create InferenceObjective CRDs</summary>
@@ -635,7 +637,7 @@ POOL_NAME=$(oc get inferencepool -n ${LLM_NS} -o json | \
     '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' | head -1)
 
 oc apply -f - <<EOF
-apiVersion: inference.networking.x-k8s.io/v1alpha2
+apiVersion: llm-d.ai/v1alpha2
 kind: InferenceObjective
 metadata:
   name: interactive-default
@@ -646,7 +648,7 @@ spec:
     group: inference.networking.k8s.io
     name: ${POOL_NAME}
 ---
-apiVersion: inference.networking.x-k8s.io/v1alpha2
+apiVersion: llm-d.ai/v1alpha2
 kind: InferenceObjective
 metadata:
   name: batch-sheddable
@@ -659,9 +661,11 @@ spec:
 EOF
 ```
 
-> **`interactive-default` (priority 100)**: Interactive clients can optionally send `x-gateway-inference-objective: interactive-default` to get the highest priority. Without this header, requests default to priority 0, which still outranks batch.
+> **Use the `llm-d.ai` group.** RHOAI installs both the `llm-d.ai` and the legacy `inference.networking.x-k8s.io` InferenceObjective CRDs. When both are present the EPP prefers `llm-d.ai` and **ignores** resources in the legacy group (it logs a warning), so objectives created as `inference.networking.x-k8s.io/v1alpha2` are silently unused. The EPP ServiceAccount already has `get`/`list`/`watch` on `inferenceobjectives` in both groups.
 
-> **`batch-sheddable` (priority -1)**: Negative priority means sheddable — when the backend is saturated, these requests are rejected immediately instead of queued. The batch processor handles retries with exponential backoff.
+> **`interactive-default` (priority 100)**: Interactive clients can optionally send `x-llm-d-inference-objective: interactive-default` to get the highest priority. Without this header, requests default to priority 0, which still outranks batch.
+
+> **`batch-sheddable` (priority -1)**: Negative priority means sheddable, so batch yields to interactive traffic. With the `flowControl` feature gate enabled, these requests buffer in the batch band and are shed with HTTP 429 when the queue TTL expires or the band's capacity fills; in-flight requests can also be revoked when `enableEviction` is set. llm-d-async retries 429s with backoff in async dispatch mode. See [Flow Control Setup](flow-control-setup.md) for the timeout constraints that govern whether TTL shedding is observable.
 
 </details>
 
